@@ -1,5 +1,7 @@
 # T-Bank Invest MCP Server (read-only)
 
+[![Tests](https://github.com/Sicness/t-bank-invest-mcp-read-only/actions/workflows/tests.yml/badge.svg)](https://github.com/Sicness/t-bank-invest-mcp-read-only/actions/workflows/tests.yml)
+
 MCP-сервер для работы с инвестиционным портфелем Т-Банка (Тинькофф) через AI-ассистентов. Предоставляет **только чтение** — сервер не может совершать сделки, выводить средства или изменять настройки счёта.
 
 ## Возможности
