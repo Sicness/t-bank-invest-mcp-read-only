@@ -56,3 +56,25 @@ Single-file implementation in `src/tbank_invest_mcp/server.py` (~800 lines).
 ## Dependencies
 
 Only two runtime dependencies: `mcp[cli]>=1.0.0` and `httpx>=0.27.0`. Build system: `hatchling`. Requires Python ≥ 3.11.
+
+## Scripts & References
+
+Вспомогательные утилиты и справочники находятся в `scripts/`:
+
+```
+scripts/
+├── money_value.py       # Конвертация MoneyValue/Quotation → float/string
+├── portfolio_parser.py  # Парсинг ответа get_portfolio
+└── references/
+    ├── MCP_TOOLS.md     # Все 38 инструментов с параметрами
+    ├── DATA_FORMATS.md  # Форматы данных и структуры ответов
+    └── PATTERNS.md      # Живые паттерны работы (читать в начале сессии!)
+```
+
+**При работе с `invest` проектом**: читать `scripts/references/PATTERNS.md` в начале каждой сессии. CLAUDE.md в директории `invest/` содержит полный skill с инструкциями.
+
+```python
+# Быстрая конвертация MoneyValue:
+from scripts.money_value import to_float, fmt
+# value = int(units) + nano / 1_000_000_000
+```
