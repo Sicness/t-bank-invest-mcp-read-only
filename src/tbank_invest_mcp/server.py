@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import ssl
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+import certifi
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-BASE_URL = "https://invest-public-api.tinkoff.ru/rest"
+BASE_URL = "https://invest-public-api.tbank.ru/rest"
 SERVICE_PREFIX = "tinkoff.public.invest.api.contract.v1"
+
+# T-API is served under certificates from the Russian Ministry of Digital
+# Development CA, which no default trust store ships. We pin that root for this
+# client only — installing it system-wide would let the CA impersonate any host.
+CA_FILE = Path(__file__).parent / "certs" / "russian_trusted_root_ca.pem"
+CA_SHA256 = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
 
 mcp = FastMCP(
     "t-bank-invest-mcp-read-only",
@@ -44,12 +54,43 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """Default trust store plus the pinned Russian Trusted Root CA."""
+    ctx = ssl.create_default_context(cafile=certifi.where())
+
+    override = os.environ.get("TBANK_CA_BUNDLE")
+    if override:
+        ctx.load_verify_locations(cafile=override)
+        return ctx
+
+    pem = CA_FILE.read_text()
+    digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+    if digest != CA_SHA256:
+        raise RuntimeError(
+            f"{CA_FILE} does not match the expected Russian Trusted Root CA "
+            f"(sha256 {digest}, expected {CA_SHA256}). Refusing to trust it. "
+            "Set TBANK_CA_BUNDLE to point at a bundle you trust if the CA "
+            "has legitimately rotated."
+        )
+    ctx.load_verify_locations(cadata=pem)
+    return ctx
+
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=30, verify=_ssl_context())
+    return _client
+
+
 async def _call(service: str, method: str, body: dict[str, Any] | None = None) -> dict:
     url = f"{BASE_URL}/{SERVICE_PREFIX}.{service}/{method}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=_headers(), json=body or {})
-        resp.raise_for_status()
-        return resp.json()
+    resp = await _get_client().post(url, headers=_headers(), json=body or {})
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _ts(dt: datetime) -> str:
