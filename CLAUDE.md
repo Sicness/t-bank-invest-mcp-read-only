@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MCP (Model Context Protocol) server providing **read-only** access to the T-Bank (Tinkoff) Investment API. It exposes 38 tools for portfolio analytics, market data, instrument search, and operations history via the FastMCP framework.
+MCP (Model Context Protocol) server providing **read-only** access to the T-Bank (Tinkoff) Investment API. It exposes 39 tools for portfolio analytics, market data, instrument search, and operations history via the FastMCP framework.
 
 ## Setup & Development
 

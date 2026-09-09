@@ -1,4 +1,4 @@
-"""Tests for all 38 MCP tool functions — _call is mocked, no real HTTP calls."""
+"""Tests for all 39 MCP tool functions — _call is mocked, no real HTTP calls."""
 
 import json
 from unittest.mock import AsyncMock, patch
@@ -423,21 +423,141 @@ class TestGetAssetFundamentals:
         assert body["assets"] == ["uid1", "uid2"]
 
 
-class TestGetConsensusForecasts:
-    async def test_paging_structure(self):
-        mock = make_call_mock()
-        with patch.object(srv, "_call", mock):
-            await srv.get_consensus_forecasts("uid123", page_limit=50, page_number=2)
-        _, _, body = mock.call_args[0]
-        assert body == {"paging": {"limit": 50, "pageNumber": 2}}
+def make_paged_call_mock(pages):
+    """pages: list of (items, total_count), consumed by pageNumber index.
 
-    async def test_defaults(self):
-        mock = make_call_mock()
+    GetConsensusForecasts has no server-side instrument filter, so
+    get_consensus_forecasts scans pages itself — this mock plays back one
+    page per call, keyed by the pageNumber the tool asked for.
+    """
+
+    async def router(service, method, body=None):
+        page_number = body["paging"]["pageNumber"]
+        items, total_count = pages[page_number]
+        return {"items": items, "page": {"totalCount": total_count}}
+
+    return AsyncMock(side_effect=router)
+
+
+class TestGetConsensusForecasts:
+    async def test_finds_match_on_first_page(self):
+        mock = make_paged_call_mock([
+            ([{"assetUid": "uid-other"}, {"assetUid": "uid-target"}], 2),
+        ])
         with patch.object(srv, "_call", mock):
-            await srv.get_consensus_forecasts("uid123")
+            result = json.loads(await srv.get_consensus_forecasts("uid-target", page_limit=2))
+        assert result["assetUid"] == "uid-target"
+        assert mock.await_count == 1
+
+    async def test_paginates_until_found(self):
+        mock = make_paged_call_mock([
+            ([{"assetUid": "uid-other"}], 4),
+            ([{"assetUid": "uid-target"}], 4),
+        ])
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("uid-target", page_limit=1))
+        assert result["assetUid"] == "uid-target"
+        assert mock.await_count == 2
+
+    async def test_stops_when_exhausted_without_match(self):
+        mock = make_paged_call_mock([
+            ([{"assetUid": "uid-other"}], 1),
+        ])
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("uid-target", page_limit=1))
+        assert "error" in result
+        assert mock.await_count == 1
+
+    async def test_respects_max_pages_cap(self):
+        # total_count is huge, so without max_pages this would loop forever.
+        mock = make_paged_call_mock([([{"assetUid": "uid-other"}], 10**6)] * 3)
+        with patch.object(srv, "_call", mock):
+            result = json.loads(
+                await srv.get_consensus_forecasts("uid-target", page_limit=1, max_pages=3)
+            )
+        assert "error" in result
+        assert mock.await_count == 3
+
+    async def test_first_call_uses_given_page_limit(self):
+        mock = make_paged_call_mock([([{"assetUid": "uid-target"}], 1)])
+        with patch.object(srv, "_call", mock):
+            await srv.get_consensus_forecasts("uid-target", page_limit=50)
         _, _, body = mock.call_args[0]
-        assert body["paging"]["limit"] == 100
-        assert body["paging"]["pageNumber"] == 0
+        assert body == {"paging": {"limit": 50, "pageNumber": 0}}
+
+
+def make_snapshot_call_mock(
+    *,
+    find_result=None,
+    fundamentals=None,
+    candles=None,
+    consensus_items=None,
+):
+    """Routes _call by method name so get_stock_snapshot's concurrent calls
+    (FindInstrument, GetAssetFundamentals, GetCandles, GetConsensusForecasts) each
+    get the right canned response."""
+    find_result = find_result if find_result is not None else {
+        "instruments": [{"uid": "uid-sber", "name": "Сбербанк"}]
+    }
+    fundamentals = fundamentals if fundamentals is not None else {
+        "fundamentals": [{"peRatioTtm": 4.2}]
+    }
+    candles = candles if candles is not None else {
+        "candles": [
+            {"close": {"units": "100", "nano": 0}},
+            {"close": {"units": "110", "nano": 0}},
+        ]
+    }
+    consensus_items = consensus_items if consensus_items is not None else [
+        {"assetUid": "uid-sber", "consensus": "RECOMMENDATION_BUY"}
+    ]
+
+    async def router(service, method, body=None):
+        if method == "FindInstrument":
+            return find_result
+        if method == "GetAssetFundamentals":
+            return fundamentals
+        if method == "GetCandles":
+            return candles
+        if method == "GetConsensusForecasts":
+            return {"items": consensus_items, "page": {"totalCount": len(consensus_items)}}
+        raise AssertionError(f"unexpected call: {service}.{method}")
+
+    return AsyncMock(side_effect=router)
+
+
+class TestGetStockSnapshot:
+    async def test_combines_all_sources(self):
+        mock = make_snapshot_call_mock()
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER"))
+        assert result["uid"] == "uid-sber"
+        assert result["name"] == "Сбербанк"
+        assert result["fundamentals"] == {"peRatioTtm": 4.2}
+        assert result["price"]["last_close"] == 110.0
+        assert result["price"]["change_5d_pct"] == 10.0
+        assert result["consensus"]["assetUid"] == "uid-sber"
+
+    async def test_no_instrument_found(self):
+        mock = make_snapshot_call_mock(find_result={"instruments": []})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("NOPE"))
+        assert "error" in result
+
+    async def test_no_candles_returns_empty_price(self):
+        mock = make_snapshot_call_mock(candles={"candles": []})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER"))
+        assert result["price"] == {}
+
+    async def test_candle_days_used_in_candles_request(self):
+        mock = make_snapshot_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_stock_snapshot("SBER", candle_days=10)
+        candles_call = next(c for c in mock.call_args_list if c[0][1] == "GetCandles")
+        body = candles_call[0][2]
+        assert body["instrumentId"] == "uid-sber"
+        assert body["interval"] == "CANDLE_INTERVAL_DAY"
 
 
 class TestGetForecastBy:

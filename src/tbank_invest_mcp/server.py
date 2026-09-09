@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -70,6 +71,13 @@ def _parse_date(s: str | None, default: datetime | None = None) -> datetime | No
 
 def _fmt(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
+    """Convert a Quotation/MoneyValue object ({units, nano}) to a plain float."""
+    if not q:
+        return None
+    return float(q.get("units", 0)) + float(q.get("nano", 0)) / 1_000_000_000
 
 
 # ── Account & User ──────────────────────────────────────────────────────────
@@ -492,20 +500,88 @@ async def get_asset_fundamentals(assets: str) -> str:
 async def get_consensus_forecasts(
     instrument_id: str,
     page_limit: int = 100,
-    page_number: int = 0,
+    max_pages: int = 50,
 ) -> str:
-    """Get analyst consensus forecasts for an instrument: target price, recommendation, number of analysts.
+    """Get the analyst consensus forecast for one instrument: target price, recommendation,
+    number of analysts.
+
+    GetConsensusForecasts has no server-side instrument filter — it only returns pages of
+    forecasts for the whole instrument universe. This scans pages internally and returns
+    just the item matching instrument_id.
 
     Args:
-        instrument_id: Instrument UID
-        page_limit: Results per page (default: 100)
-        page_number: Page number starting from 0
+        instrument_id: Instrument UID (matched against each item's asset_uid)
+        page_limit: Page size used while scanning (default: 100)
+        max_pages: Safety cap on how many pages to scan before giving up (default: 50)
     """
-    data = await _call("InstrumentsService", "GetConsensusForecasts", {
-        "paging": {"limit": page_limit, "pageNumber": page_number},
+    page_number = 0
+    while page_number < max_pages:
+        data = await _call("InstrumentsService", "GetConsensusForecasts", {
+            "paging": {"limit": page_limit, "pageNumber": page_number},
+        })
+        items = data.get("items", [])
+        match = next((item for item in items if item.get("assetUid") == instrument_id), None)
+        if match is not None:
+            return _fmt(match)
+
+        total_count = data.get("page", {}).get("totalCount", 0)
+        page_number += 1
+        if page_number * page_limit >= total_count:
+            break
+
+    return _fmt({"error": f"No consensus forecast found for instrument_id={instrument_id!r}"})
+
+
+@mcp.tool()
+async def get_stock_snapshot(ticker: str, candle_days: int = 5) -> str:
+    """Get a one-call overview of a stock: fundamentals, recent price change, and analyst consensus.
+
+    Convenience wrapper around FindInstrument + GetAssetFundamentals + GetCandles +
+    GetConsensusForecasts, so a caller doesn't need 3-4 separate round trips (and the manual
+    ticker-to-UID resolution step) just to get a compact picture of one instrument.
+
+    Args:
+        ticker: Ticker, name, ISIN, or FIGI to look up (passed to FindInstrument)
+        candle_days: How many days of daily candles to use for the price summary (default: 5)
+    """
+    found = await _call("InstrumentsService", "FindInstrument", {"query": ticker})
+    instruments = found.get("instruments", [])
+    if not instruments:
+        return _fmt({"error": f"No instrument found for ticker={ticker!r}"})
+    instrument = instruments[0]
+    uid = instrument.get("uid", "")
+
+    now = datetime.now(timezone.utc)
+    fundamentals_data, candles_data, consensus_raw = await asyncio.gather(
+        _call("InstrumentsService", "GetAssetFundamentals", {"assets": [uid]}),
+        _call("MarketDataService", "GetCandles", {
+            "instrumentId": uid,
+            "from": _ts(now - timedelta(days=candle_days)),
+            "to": _ts(now),
+            "interval": "CANDLE_INTERVAL_DAY",
+        }),
+        get_consensus_forecasts(uid),
+    )
+
+    fundamentals = next(iter(fundamentals_data.get("fundamentals", [])), {})
+    candles = candles_data.get("candles", [])
+
+    price: dict[str, Any] = {}
+    if candles:
+        first_close = _quotation_to_float(candles[0].get("close"))
+        last_close = _quotation_to_float(candles[-1].get("close"))
+        price["last_close"] = last_close
+        if first_close:
+            price[f"change_{candle_days}d_pct"] = round((last_close - first_close) / first_close * 100, 2)
+
+    return _fmt({
+        "ticker": ticker,
+        "uid": uid,
+        "name": instrument.get("name"),
+        "price": price,
+        "fundamentals": fundamentals,
+        "consensus": json.loads(consensus_raw),
     })
-    # Filter for the requested instrument if needed
-    return _fmt(data)
 
 
 @mcp.tool()
