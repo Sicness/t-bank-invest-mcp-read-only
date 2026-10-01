@@ -1524,9 +1524,12 @@ async def get_order_state(account_id: str, order_id: str) -> str:
 
 @read_only_tool
 async def list_shares(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
-    """Get list of all available shares (stocks).
+    """Get the full reference list of shares (stocks): every field of every share.
 
-    Warning: returns a large dataset. Use find_instrument for searching specific shares.
+    A dump for scripts, not something to read: about 1,900 shares and 2 MB of JSON with
+    INSTRUMENT_STATUS_BASE, 8 MB with INSTRUMENT_STATUS_ALL — far more than fits in a
+    model's context; a client saves such a result to a file or refuses it. To find
+    particular shares use find_instrument, and get_share_by for the details of one.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
@@ -1539,9 +1542,13 @@ async def list_shares(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_B
 
 @read_only_tool
 async def list_bonds(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
-    """Get list of all available bonds.
+    """Get the full reference list of bonds: every field of every bond.
 
-    Warning: returns a large dataset. Use find_instrument for searching specific bonds.
+    A dump for scripts, not something to read: about 1,600 bonds and 2.4 MB of JSON with
+    INSTRUMENT_STATUS_BASE — far more than fits in a model's context; a client saves such
+    a result to a file or refuses it. INSTRUMENT_STATUS_ALL is 38 MB, and the API drops
+    the connection before sending it all. To find particular bonds use find_instrument
+    with instrument_kind="bond", and get_bond_by for the details of one.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
@@ -1554,7 +1561,12 @@ async def list_bonds(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BA
 
 @read_only_tool
 async def list_etfs(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
-    """Get list of all available ETFs and funds.
+    """Get the full reference list of ETFs and funds: every field of every fund.
+
+    A dump for scripts, not something to read: about 280 funds and 300 KB of JSON with
+    INSTRUMENT_STATUS_BASE, 2.3 MB with INSTRUMENT_STATUS_ALL — more than fits in a model's
+    context; a client saves such a result to a file or refuses it. To find particular
+    funds use find_instrument with instrument_kind="etf", and get_etf_by for one.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
@@ -1569,6 +1581,9 @@ async def list_etfs(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BAS
 async def list_currencies(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available currency instruments.
 
+    Small enough to read: about 15 instruments and 13 KB with INSTRUMENT_STATUS_BASE, twice
+    that with INSTRUMENT_STATUS_ALL.
+
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
@@ -1580,7 +1595,13 @@ async def list_currencies(instrument_status: InstrumentStatus = "INSTRUMENT_STAT
 
 @read_only_tool
 async def list_futures(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
-    """Get list of all available futures contracts.
+    """Get the full reference list of futures contracts: every field of every contract.
+
+    A dump for scripts, not something to read: about 530 contracts and 700 KB of JSON with
+    INSTRUMENT_STATUS_BASE, 3.5 MB with INSTRUMENT_STATUS_ALL — far more than fits in a
+    model's context; a client saves such a result to a file or refuses it. To find
+    particular contracts use find_instrument with instrument_kind="futures", and
+    get_future_by for one.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
