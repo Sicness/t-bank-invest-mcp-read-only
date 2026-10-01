@@ -999,9 +999,52 @@ class TestGetTechAnalysis:
         with patch.object(srv, "_call", mock):
             await srv.get_tech_analysis("uid123", "INDICATOR_TYPE_SMA")
         _, _, body = mock.call_args[0]
-        assert body["interval"] == "CANDLE_INTERVAL_DAY"
+        # GetTechAnalysis has its own interval enum; it rejects the CANDLE_INTERVAL_* names.
+        assert body["interval"] == "INDICATOR_INTERVAL_ONE_DAY"
         assert body["typeOfPrice"] == "TYPE_OF_PRICE_CLOSE"
         assert body["length"] == 14
+
+    @pytest.mark.parametrize("indicator", ["INDICATOR_TYPE_SMA", "INDICATOR_TYPE_EMA", "INDICATOR_TYPE_RSI"])
+    async def test_single_line_indicators_send_no_extra_params(self, indicator):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis("uid123", indicator)
+        _, _, body = mock.call_args[0]
+        assert "deviation" not in body
+        assert "smoothing" not in body
+
+    async def test_bb_sends_deviation(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis("uid123", "INDICATOR_TYPE_BB")
+        _, _, body = mock.call_args[0]
+        assert body["deviation"] == {"deviationMultiplier": {"units": "2", "nano": 0}}
+        assert "smoothing" not in body
+
+    async def test_bb_custom_deviation(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis("uid123", "INDICATOR_TYPE_BB", length=20, deviation=2.5)
+        _, _, body = mock.call_args[0]
+        assert body["length"] == 20
+        assert body["deviation"] == {"deviationMultiplier": {"units": "2", "nano": 500_000_000}}
+
+    async def test_macd_sends_smoothing(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis("uid123", "INDICATOR_TYPE_MACD")
+        _, _, body = mock.call_args[0]
+        assert body["smoothing"] == {"fastLength": 12, "slowLength": 26, "signalSmoothing": 9}
+        assert "deviation" not in body
+
+    async def test_macd_custom_smoothing(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis(
+                "uid123", "INDICATOR_TYPE_MACD", fast_length=5, slow_length=35, signal_smoothing=5,
+            )
+        _, _, body = mock.call_args[0]
+        assert body["smoothing"] == {"fastLength": 5, "slowLength": 35, "signalSmoothing": 5}
 
     async def test_dates_present(self):
         mock = make_call_mock()

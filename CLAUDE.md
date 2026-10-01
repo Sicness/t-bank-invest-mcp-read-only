@@ -16,20 +16,20 @@ pip install -e ".[test]"          # editable install + pytest, pytest-asyncio
 
 pytest                            # whole suite, no network
 pytest tests/test_tools.py -k snapshot
-grep -c '^@mcp.tool()' src/tbank_invest_mcp/server.py   # how many tools there are
+grep -c '^@read_only_tool' src/tbank_invest_mcp/server.py   # how many tools there are
 
 export TBANK_INVEST_TOKEN=...     # https://www.tbank.ru/invest/settings/api/
 t-bank-invest-mcp-read-only       # run over stdio (same as python -m tbank_invest_mcp)
 mcp dev src/tbank_invest_mcp/server.py   # run under the MCP Inspector
 ```
 
-The server reads the token from the environment only; it does not load `.env` (`.env.example` just documents the variable). No linter or formatter is configured. CI (`.github/workflows/tests.yml`) runs `pytest --tb=short -q -x` on Python 3.11–3.13 for pushes and PRs to `main`.
+The server reads the token from the environment only; it does not load `.env` (`.env.example` just documents the variable). No linter or formatter is configured. CI (`.github/workflows/tests.yml`) runs `pytest --tb=short -q -x` on Python 3.11–3.13 for pushes and PRs to `main`, plus once against the oldest `mcp` version the package claims to support.
 
 ## Architecture
 
-Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → `mcp = FastMCP(...)` → private helpers → tools grouped under `# ── Section ──` banners (Account & User, Portfolio & Positions, Operations, Instruments, Market Data, Orders, Instrument Lists) → `main()`.
+Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → `mcp = FastMCP(...)` → the `read_only_tool` decorator → private helpers → tools grouped under `# ── Section ──` banners (Account & User, Portfolio & Positions, Operations, Instruments, Market Data, Orders, Instrument Lists) → `main()`.
 
-**Request path.** Every tool is an `async def` decorated with `@mcp.tool()` that builds a JSON body and awaits `_call(service, method, body)`, which POSTs to `{BASE_URL}/tinkoff.public.invest.api.contract.v1.{Service}/{Method}` (`BASE_URL = https://invest-public-api.tbank.ru/rest`) through one shared `httpx.AsyncClient` and returns the parsed JSON. Services in use: `UsersService`, `OperationsService`, `InstrumentsService`, `MarketDataService`, `OrdersService`.
+**Request path.** Every tool is an `async def` decorated with `@read_only_tool` that builds a JSON body and awaits `_call(service, method, body)`, which POSTs to `{BASE_URL}/tinkoff.public.invest.api.contract.v1.{Service}/{Method}` (`BASE_URL = https://invest-public-api.tbank.ru/rest`) through one shared `httpx.AsyncClient` and returns the parsed JSON. Services in use: `UsersService`, `OperationsService`, `InstrumentsService`, `MarketDataService`, `OrdersService`.
 
 **Helpers**
 
@@ -37,10 +37,12 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 |---|---|
 | `_get_token()` / `_headers()` | Bearer auth from `TBANK_INVEST_TOKEN`; raises `ValueError` if unset |
 | `_ssl_context()` / `_get_client()` | pinned-CA TLS context; lazily created module-level client (30 s timeout) |
-| `_call(service, method, body)` | the only place that does HTTP; `raise_for_status()` then `.json()` |
+| `read_only_tool(fn)` | the only way a tool is registered: `readOnlyHint`, dedented docstring as description, text-only output |
+| `_call(service, method, body)` | the only place that does HTTP; returns `.json()`, or raises `httpx.HTTPStatusError` whose text is `_api_error(...)` |
+| `_api_error(service, method, resp)` | the error line the model reads: HTTP status, method, the API's `message` and error code |
 | `_ts(dt)` / `_parse_date(s, default)` | UTC datetime ↔ RFC 3339; accepts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, with or without `Z` |
-| `_fmt(data)` | `json.dumps(..., ensure_ascii=False, indent=2)` — what every tool returns |
-| `_quotation_to_float(q)` | `{units, nano}` → float, `None` for a missing value |
+| `_fmt(data)` | compact `json.dumps(..., ensure_ascii=False)` — what every tool returns |
+| `_quotation_to_float(q)` / `_to_quotation(value)` | `{units, nano}` → float (`None` for a missing value), and a number → `{units, nano}` for a request body |
 | `_asset_uid(instrument_uid)` | instrument UID → asset UID via `GetInstrumentBy`; `""` on 404 |
 | `_consensus_forecast(asset_uids, ...)` | pages through `GetConsensusForecasts` to find one asset's item |
 | `_pick_instrument(instruments, query, class_code)` | chooses one `FindInstrument` hit |
@@ -50,12 +52,13 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 ## Tool conventions
 
 - **The docstring is the tool's public contract.** FastMCP sends it, with the `Args:` section, to the MCP client as the tool description, and the model on the other side decides how to call the tool from that text alone. Keep parameters, defaults and the return shape described there in step with the code.
+- **Every tool is registered with `@read_only_tool`, never with `mcp.tool()` directly.** It marks the tool `readOnlyHint` for the client — which is what lets a client skip confirmation prompts — and turns off FastMCP's structured output: tools return a JSON string, and FastMCP would otherwise send that string a second time wrapped in `structuredContent`. `tests/test_server.py` fails if a tool bypasses it.
 - **Most tools are thin pass-throughs**: build the body, `_call`, `return _fmt(data)` — the raw API response with its camelCase keys. Only composite tools shape their own output (`get_stock_snapshot`, `get_consensus_forecasts`); those use snake_case keys for what they add.
 - **Parameters are flat strings, ints and bools.** Lists arrive as comma-separated strings and are split and stripped in the tool (`assets`, `instrument_ids`, `operation_types`). Optional parameters default to `""` and are left out of the body when empty.
 - **Dates** come in as strings through `_parse_date`, each tool supplying its own default window (documented in its docstring) relative to `datetime.now(timezone.utc)`.
 - **Enums** go to the API as full prefixed strings (`CANDLE_INTERVAL_DAY`, `INSTRUMENT_ID_TYPE_UID`, `INDICATOR_TYPE_RSI`) and most tools expect the caller to pass them that way. The exceptions add the prefix themselves: `state` (`EXECUTED` → `OPERATION_STATE_EXECUTED`) and `operation_types` (`BUY` → `OPERATION_TYPE_BUY`). `get_portfolio` sends currency as an integer (RUB 0, USD 1, EUR 2).
 - **Out-of-range numbers are clamped**, not rejected (`limit` 1–1000, order book `depth` 1–50).
-- **Errors.** HTTP failures propagate from `_call` as `httpx.HTTPStatusError`, and bad arguments raise `ValueError`; FastMCP reports either to the client as a tool error. "Looked and found nothing" is a normal result instead: the composite tools return `{"error": "..."}`.
+- **Errors.** HTTP failures propagate from `_call` as `httpx.HTTPStatusError`, and bad arguments raise `ValueError`; FastMCP reports either to the client as a tool error, and the exception's text is all the model gets to correct itself with. So `_call` puts the API's own explanation there (`T-Bank API returned HTTP 404 for InstrumentsService/GetInstrumentBy: Instrument not found (error code 50002)`); write `ValueError` messages to the same standard. "Looked and found nothing" is a normal result instead: the composite tools return `{"error": "..."}`.
 - **Nothing may write to stdout.** The server speaks MCP over stdio, so a stray `print` corrupts the protocol stream.
 
 ## T-Bank API facts worth knowing
@@ -66,14 +69,16 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 - **Instrument UID ≠ asset UID.** One asset (a company's share) has many instruments (listings). `FindInstrument` and the `*By` lookups return the instrument UID; `GetAssetFundamentals` and consensus forecasts are keyed by asset UID (`assetUid` in the `GetInstrumentBy` response). A consensus forecast item's own `uid` is the forecast record's id, not an instrument.
 - `FindInstrument` returns every listing of a paper — delisted and non-tradable class codes included — and not in relevance order: the first hit for `SBER` is not SBER on TQBR. Narrow with `instrumentKind`, an exact ticker match and `apiTradeAvailableFlag`.
 - `GetConsensusForecasts` has no per-instrument filter, only paging over the whole list (on the order of a hundred items).
-- An unknown id gives HTTP 404 with `{"code": 5, "message": "Instrument not found"}`.
+- Errors come as `{"code", "message", "description"}`, where `description` is T-Bank's numeric error code (listed in `src/docs/errors.md` of the same repository). An unknown id gives HTTP 404 with `{"code": 5, "message": "Instrument not found", "description": "50002"}`.
+- `GetTechAnalysis` has its own interval enum (`INDICATOR_INTERVAL_ONE_DAY`, …) and rejects the `CANDLE_INTERVAL_*` names of `GetCandles`. It also rejects `INDICATOR_TYPE_BB` without `deviation` and `INDICATOR_TYPE_MACD` without `smoothing`. MACD gives the same result with or without `length`; SMA is rejected without it.
 
 ## Tests
 
 - `tests/test_tools.py` — every tool. `_call` is replaced with an `AsyncMock` (`patch.object(srv, "_call", mock)`), then the test asserts on `mock.call_args[0]` → `(service, method, body)` and on the returned JSON. Tools that make several calls use a router mock keyed by method name (`make_paged_call_mock`, `make_snapshot_call_mock`).
-- `tests/test_call.py` — `_call` itself against a mocked `AsyncClient`: URL, headers, body, error propagation. It resets `server._client` around each test because the client is module-level.
+- `tests/test_call.py` — `_call` itself against a mocked `AsyncClient`: URL, headers, body, error propagation and the error text (those tests use real `httpx.Response` objects). It resets `server._client` around each test because the client is module-level.
 - `tests/test_ssl.py` — the pinned CA, the fingerprint guard, the `TBANK_CA_BUNDLE` override.
-- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_fmt`.
+- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_fmt`, `_to_quotation`.
+- `tests/test_server.py` — what an MCP client receives, through `mcp.list_tools()` and `mcp.call_tool()`: every tool registered and marked read-only, descriptions, the reported server version, the shape of a result and of an error.
 
 `asyncio_mode = "auto"`, so async tests need no marker.
 
@@ -81,11 +86,11 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 
 ## Adding or changing a tool
 
-1. Put it under the matching section banner, as `@mcp.tool()` + `async def`, with a docstring that has an `Args:` section.
+1. Put it under the matching section banner, as `@read_only_tool` + `async def`, with a docstring that has an `Args:` section.
 2. Check the method's request and response fields in the proto contract rather than guessing names.
 3. Add a test class to `tests/test_tools.py` covering the request body, defaults and any shaping of the result.
 4. Update the tool table in `README.md` (Russian), and the helper table here if a helper was added.
-5. Renaming a tool, renaming or removing a parameter, or changing an output shape breaks existing clients — say so in the commit message.
+5. Renaming a tool, renaming or removing a parameter, or changing an output shape breaks existing clients. Don't: extend instead — a new optional parameter whose default keeps the old behaviour, or a new tool next to the old one.
 
 ## Releasing
 
@@ -93,11 +98,11 @@ Users install with `uvx` straight from this repository (see `README.md`), so the
 
 To release: set `version` in `pyproject.toml` to the release number, commit, then tag that commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` refuses a tag that differs from the version, builds sdist and wheel, runs the test suite against the installed wheel, publishes to PyPI through Trusted Publishing (the `pypi` environment; no API token is stored) and creates a GitHub Release with generated notes.
 
-The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0` and tool contracts may still change. From 1.0.0 on, semantic versioning applies to the tool contract: major for a renamed or removed tool or parameter or a changed output shape, minor for new tools and parameters, patch for fixes.
+The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0`. Semantic versioning applies to the tool contract: minor for new tools and parameters, patch for fixes. A major bump would mean a renamed or removed tool or parameter or a changed output shape, and that is not planned — people already run this server from `main`.
 
 ## Dependencies
 
-Runtime: `mcp[cli]>=1.0.0,<2`, `httpx>=0.27.0`, `certifi`. The `<2` cap is deliberate: mcp 2.x removed `mcp.server.fastmcp` (`FastMCP` became `MCPServer`) and there is no lockfile, so without the cap a fresh install fails on import. Moving to the v2 API is a separate change. Test extra: `pytest>=8.0`, `pytest-asyncio>=0.23`. Build backend: `hatchling`. Python ≥ 3.11.
+Runtime: `mcp[cli]>=1.14.0,<2`, `httpx>=0.27.0`, `certifi`. The floor is real: on older releases FastMCP cannot register tools from a module that uses `from __future__ import annotations`, so the server fails on import; CI runs the suite against exactly that version. The `<2` cap is deliberate: mcp 2.x removed `mcp.server.fastmcp` (`FastMCP` became `MCPServer`) and there is no lockfile, so without the cap a fresh install fails on import. Moving to the v2 API is a separate change. Test extra: `pytest>=8.0`, `pytest-asyncio>=0.23`. Build backend: `hatchling`. Python ≥ 3.11.
 
 ## Related project: `invest`
 

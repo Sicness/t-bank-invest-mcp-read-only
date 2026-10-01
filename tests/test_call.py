@@ -110,3 +110,56 @@ class TestCallResponse:
         with patch("httpx.AsyncClient", return_value=client):
             with pytest.raises(httpx.HTTPStatusError):
                 await _call("InstrumentsService", "GetInstrumentBy", {"id": "xxx"})
+
+
+class TestCallErrorMessage:
+    """The exception text is what the model reads as the tool error."""
+
+    @staticmethod
+    async def _error(response: httpx.Response) -> httpx.HTTPStatusError:
+        # A real httpx.Response, so raise_for_status() behaves exactly as in production.
+        response.request = httpx.Request("POST", f"{BASE_URL}/{SERVICE_PREFIX}.InstrumentsService/GetInstrumentBy")
+        client = AsyncMock()
+        client.post.return_value = response
+        with patch("httpx.AsyncClient", return_value=client):
+            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                await _call("InstrumentsService", "GetInstrumentBy", {"id": "xxx"})
+        return exc_info.value
+
+    async def test_carries_api_message_and_code(self):
+        error = await self._error(httpx.Response(
+            404, json={"code": 5, "message": "Instrument not found", "description": "50002"},
+        ))
+        assert str(error) == (
+            "T-Bank API returned HTTP 404 for InstrumentsService/GetInstrumentBy: "
+            "Instrument not found (error code 50002)"
+        )
+
+    async def test_message_without_code(self):
+        error = await self._error(httpx.Response(400, json={"message": "`interval` is invalid"}))
+        assert str(error).endswith("GetInstrumentBy: `interval` is invalid")
+
+    async def test_non_json_body_is_quoted(self):
+        error = await self._error(httpx.Response(502, text="<html>Bad Gateway</html>"))
+        assert str(error).endswith("HTTP 502 for InstrumentsService/GetInstrumentBy: <html>Bad Gateway</html>")
+
+    async def test_empty_body(self):
+        error = await self._error(httpx.Response(503))
+        assert str(error).endswith("no details in the response")
+
+    async def test_json_without_message_is_quoted(self):
+        error = await self._error(httpx.Response(500, json={"unexpected": True}))
+        assert '"unexpected"' in str(error)
+
+    async def test_long_body_is_truncated(self):
+        error = await self._error(httpx.Response(500, text="x" * 5000))
+        assert len(str(error)) < 500
+
+    async def test_no_url_or_token_in_message(self):
+        error = await self._error(httpx.Response(401, json={"message": "Authentication token is missing or invalid"}))
+        assert "https://" not in str(error)
+        assert "test-token" not in str(error)
+
+    async def test_response_stays_available(self):
+        error = await self._error(httpx.Response(404, json={"message": "Instrument not found"}))
+        assert error.response.status_code == 404

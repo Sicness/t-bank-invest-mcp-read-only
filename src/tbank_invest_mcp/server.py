@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import ssl
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,9 @@ from typing import Any
 import certifi
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+
+from tbank_invest_mcp import __version__
 
 BASE_URL = "https://invest-public-api.tbank.ru/rest"
 SERVICE_PREFIX = "tinkoff.public.invest.api.contract.v1"
@@ -35,6 +40,23 @@ mcp = FastMCP(
         "Quotation format is the same but without currency."
     ),
 )
+# FastMCP takes no version and would report the MCP SDK's own version as the server's.
+mcp._mcp_server.version = __version__
+
+
+def read_only_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register fn as an MCP tool. Every tool of this server goes through here.
+
+    The client is told the tool only reads (readOnlyHint), the docstring becomes the
+    description without its source indentation, and the JSON string the tool returns
+    is sent once as text — by default FastMCP would also wrap that same string into
+    structuredContent, sending every response twice.
+    """
+    return mcp.tool(
+        description=inspect.cleandoc(fn.__doc__ or ""),
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+        structured_output=False,
+    )(fn)
 
 
 def _get_token() -> str:
@@ -87,10 +109,32 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+def _api_error(service: str, method: str, resp: httpx.Response) -> str:
+    """What the API said went wrong: its message and error code, not just the HTTP status."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and payload.get("message"):
+        detail = str(payload["message"])
+        if payload.get("description"):
+            detail += f" (error code {payload['description']})"
+    else:
+        detail = resp.text.strip()[:300] or "no details in the response"
+    return f"T-Bank API returned HTTP {resp.status_code} for {service}/{method}: {detail}"
+
+
 async def _call(service: str, method: str, body: dict[str, Any] | None = None) -> dict:
     url = f"{BASE_URL}/{SERVICE_PREFIX}.{service}/{method}"
     resp = await _get_client().post(url, headers=_headers(), json=body or {})
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # Same exception, but its text is what the model reads as the tool error: say what
+        # the API answered instead of httpx's status line, URL and a link to MDN.
+        raise httpx.HTTPStatusError(
+            _api_error(service, method, resp), request=e.request, response=e.response
+        ) from None
     return resp.json()
 
 
@@ -111,7 +155,8 @@ def _parse_date(s: str | None, default: datetime | None = None) -> datetime | No
 
 
 def _fmt(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    # Compact: the reader is a model, and indentation is a third or more of a response.
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
@@ -121,10 +166,16 @@ def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
     return float(q.get("units", 0)) + float(q.get("nano", 0)) / 1_000_000_000
 
 
+def _to_quotation(value: float) -> dict[str, Any]:
+    """Convert a number to a Quotation object ({units, nano}) for a request body."""
+    units = int(value)
+    return {"units": str(units), "nano": round((value - units) * 1_000_000_000)}
+
+
 # ── Account & User ──────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def get_accounts() -> str:
     """Get list of all user investment accounts with their types and statuses.
 
@@ -135,14 +186,14 @@ async def get_accounts() -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_user_info() -> str:
     """Get user information: tariff, qualified investor status, premium status, risk level."""
     data = await _call("UsersService", "GetInfo", {})
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_margin_attributes(account_id: str) -> str:
     """Get margin trading attributes for an account: liquid portfolio value, starting/minimal margin, funds sufficiency.
 
@@ -156,7 +207,7 @@ async def get_margin_attributes(account_id: str) -> str:
 # ── Portfolio & Positions ────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
     """Get full portfolio for an account: total values by asset type, all positions with prices, yields, and quantities.
 
@@ -175,7 +226,7 @@ async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_positions(account_id: str) -> str:
     """Get all positions in an account: securities, futures, options, and cash balances.
 
@@ -188,7 +239,7 @@ async def get_positions(account_id: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_withdraw_limits(account_id: str) -> str:
     """Get available withdrawal limits for an account: free cash, blocked amounts, futures guarantees.
 
@@ -202,7 +253,7 @@ async def get_withdraw_limits(account_id: str) -> str:
 # ── Operations ───────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def get_operations(
     account_id: str,
     from_date: str = "",
@@ -240,7 +291,7 @@ async def get_operations(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_operations_by_cursor(
     account_id: str,
     from_date: str = "",
@@ -301,7 +352,7 @@ async def get_operations_by_cursor(
 # ── Instruments ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def find_instrument(query: str) -> str:
     """Search for instruments by text query (ticker, name, ISIN, FIGI).
 
@@ -314,7 +365,7 @@ async def find_instrument(query: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_instrument_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -336,7 +387,7 @@ async def get_instrument_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_bond_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -356,7 +407,7 @@ async def get_bond_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_bond_coupons(
     figi: str = "",
     instrument_id: str = "",
@@ -384,7 +435,7 @@ async def get_bond_coupons(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_bond_events(instrument_id: str, type: str = "") -> str:
     """Get bond events: coupon payments, amortizations, calls, puts, etc.
 
@@ -399,7 +450,7 @@ async def get_bond_events(instrument_id: str, type: str = "") -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_share_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -419,7 +470,7 @@ async def get_share_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_etf_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -439,7 +490,7 @@ async def get_etf_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_currency_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -459,7 +510,7 @@ async def get_currency_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_future_by(
     id: str,
     id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
@@ -479,7 +530,7 @@ async def get_future_by(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_dividends(
     instrument_id: str,
     from_date: str = "",
@@ -503,7 +554,7 @@ async def get_dividends(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_accrued_interests(
     instrument_id: str,
     from_date: str = "",
@@ -525,7 +576,7 @@ async def get_accrued_interests(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_asset_fundamentals(assets: str) -> str:
     """Get fundamental financial data for assets: P/E, P/BV, EPS, ROE, revenue, market cap, etc.
 
@@ -583,7 +634,7 @@ async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_p
     )}
 
 
-@mcp.tool()
+@read_only_tool
 async def get_consensus_forecasts(
     instrument_id: str,
     page_limit: int = 100,
@@ -620,7 +671,7 @@ def _pick_instrument(instruments: list[dict], query: str, class_code: str = "") 
     return next((i for i in candidates if i.get("apiTradeAvailableFlag")), next(iter(candidates), None))
 
 
-@mcp.tool()
+@read_only_tool
 async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str = "") -> str:
     """Get a one-call overview of a share: fundamentals, recent price change, and analyst consensus.
 
@@ -695,7 +746,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     })
 
 
-@mcp.tool()
+@read_only_tool
 async def get_forecast_by(instrument_id: str) -> str:
     """Get investment house price forecasts for an instrument.
 
@@ -708,7 +759,7 @@ async def get_forecast_by(instrument_id: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_asset_reports(
     instrument_id: str,
     from_date: str = "",
@@ -730,14 +781,14 @@ async def get_asset_reports(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_favorites() -> str:
     """Get list of user's favorite instruments."""
     data = await _call("InstrumentsService", "GetFavorites", {})
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_trading_schedules(
     exchange: str = "",
     from_date: str = "",
@@ -764,7 +815,7 @@ async def get_trading_schedules(
 # ── Market Data ──────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def get_candles(
     instrument_id: str,
     from_date: str = "",
@@ -791,7 +842,7 @@ async def get_candles(
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_last_prices(instrument_ids: str) -> str:
     """Get last trade prices for one or more instruments.
 
@@ -803,7 +854,7 @@ async def get_last_prices(instrument_ids: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_order_book(instrument_id: str, depth: int = 20) -> str:
     """Get order book (market depth) for an instrument: bids, asks, last price, spread.
 
@@ -818,7 +869,7 @@ async def get_order_book(instrument_id: str, depth: int = 20) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_close_prices(instrument_ids: str) -> str:
     """Get previous trading session close prices for instruments.
 
@@ -831,7 +882,7 @@ async def get_close_prices(instrument_ids: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_trading_status(instrument_id: str) -> str:
     """Get current trading status for an instrument: is it tradeable, auction phase, etc.
 
@@ -842,17 +893,25 @@ async def get_trading_status(instrument_id: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_tech_analysis(
     instrument_id: str,
     indicator_type: str,
     from_date: str = "",
     to_date: str = "",
-    interval: str = "CANDLE_INTERVAL_DAY",
+    interval: str = "INDICATOR_INTERVAL_ONE_DAY",
     type_of_price: str = "TYPE_OF_PRICE_CLOSE",
     length: int = 14,
+    deviation: float = 2.0,
+    fast_length: int = 12,
+    slow_length: int = 26,
+    signal_smoothing: int = 9,
 ) -> str:
     """Get technical analysis indicators (SMA, EMA, RSI, MACD, BB) for an instrument.
+
+    Returns technicalIndicators: one item per interval with a timestamp and the indicator's
+    values — signal (SMA, EMA, RSI), macd and signal (MACD), or middleBand, upperBand and
+    lowerBand (BB).
 
     Args:
         instrument_id: Instrument UID
@@ -860,9 +919,17 @@ async def get_tech_analysis(
                        INDICATOR_TYPE_MACD, INDICATOR_TYPE_BB
         from_date: Start date (YYYY-MM-DD), default: 90 days ago
         to_date: End date (YYYY-MM-DD), default: now
-        interval: Candle interval (see get_candles)
+        interval: Not the get_candles names. INDICATOR_INTERVAL_ONE_MINUTE, INDICATOR_INTERVAL_2_MIN,
+                  INDICATOR_INTERVAL_3_MIN, INDICATOR_INTERVAL_FIVE_MINUTES, INDICATOR_INTERVAL_10_MIN,
+                  INDICATOR_INTERVAL_FIFTEEN_MINUTES, INDICATOR_INTERVAL_30_MIN, INDICATOR_INTERVAL_ONE_HOUR,
+                  INDICATOR_INTERVAL_2_HOUR, INDICATOR_INTERVAL_4_HOUR, INDICATOR_INTERVAL_ONE_DAY (default),
+                  INDICATOR_INTERVAL_WEEK, INDICATOR_INTERVAL_MONTH
         type_of_price: TYPE_OF_PRICE_CLOSE, TYPE_OF_PRICE_OPEN, TYPE_OF_PRICE_HIGH, TYPE_OF_PRICE_LOW, TYPE_OF_PRICE_AVG
-        length: Indicator period length (default: 14)
+        length: Indicator period in intervals (default: 14); MACD ignores it
+        deviation: BB only — number of standard deviations between the middle and outer bands (default: 2)
+        fast_length: MACD only — period of the fast EMA (default: 12)
+        slow_length: MACD only — period of the slow EMA (default: 26)
+        signal_smoothing: MACD only — period of the signal line (default: 9)
     """
     now = datetime.now(timezone.utc)
     body: dict[str, Any] = {
@@ -874,6 +941,15 @@ async def get_tech_analysis(
         "typeOfPrice": type_of_price,
         "length": length,
     }
+    # The API rejects BB without deviation and MACD without smoothing.
+    if indicator_type == "INDICATOR_TYPE_BB":
+        body["deviation"] = {"deviationMultiplier": _to_quotation(deviation)}
+    if indicator_type == "INDICATOR_TYPE_MACD":
+        body["smoothing"] = {
+            "fastLength": fast_length,
+            "slowLength": slow_length,
+            "signalSmoothing": signal_smoothing,
+        }
     data = await _call("MarketDataService", "GetTechAnalysis", body)
     return _fmt(data)
 
@@ -881,7 +957,7 @@ async def get_tech_analysis(
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def get_orders(account_id: str) -> str:
     """Get list of active (pending) orders for an account.
 
@@ -894,7 +970,7 @@ async def get_orders(account_id: str) -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def get_order_state(account_id: str, order_id: str) -> str:
     """Get detailed status of a specific order: execution status, filled quantity, average price.
 
@@ -912,7 +988,7 @@ async def get_order_state(account_id: str, order_id: str) -> str:
 # ── Instrument Lists ─────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@read_only_tool
 async def list_shares(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available shares (stocks).
 
@@ -925,7 +1001,7 @@ async def list_shares(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def list_bonds(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available bonds.
 
@@ -938,7 +1014,7 @@ async def list_bonds(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def list_etfs(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available ETFs and funds.
 
@@ -949,7 +1025,7 @@ async def list_etfs(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def list_currencies(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available currency instruments.
 
@@ -960,7 +1036,7 @@ async def list_currencies(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> 
     return _fmt(data)
 
 
-@mcp.tool()
+@read_only_tool
 async def list_futures(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available futures contracts.
 

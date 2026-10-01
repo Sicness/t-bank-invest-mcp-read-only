@@ -1,11 +1,19 @@
-"""Tests for helper functions: _get_token, _headers, _ts, _parse_date, _fmt."""
+"""Tests for helper functions: _get_token, _headers, _ts, _parse_date, _fmt, _to_quotation."""
 
 import json
 from datetime import datetime, timezone
 
 import pytest
 
-from tbank_invest_mcp.server import _fmt, _get_token, _headers, _parse_date, _ts
+from tbank_invest_mcp.server import (
+    _fmt,
+    _get_token,
+    _headers,
+    _parse_date,
+    _quotation_to_float,
+    _to_quotation,
+    _ts,
+)
 
 
 class TestGetToken:
@@ -85,12 +93,8 @@ class TestFmt:
         assert "Газпром" in result
         assert "\\u" not in result
 
-    def test_indent(self):
-        result = _fmt({"a": 1})
-        lines = result.splitlines()
-        assert len(lines) > 1
-        # 2-space indent
-        assert lines[1].startswith("  ")
+    def test_compact(self):
+        assert _fmt({"a": 1, "b": [1, {"c": None}]}) == '{"a":1,"b":[1,{"c":null}]}'
 
     def test_none_value(self):
         result = _fmt(None)
@@ -100,3 +104,20 @@ class TestFmt:
         result = _fmt([1, 2, 3])
         parsed = json.loads(result)
         assert parsed == [1, 2, 3]
+
+
+class TestToQuotation:
+    @pytest.mark.parametrize("value,expected", [
+        (2, {"units": "2", "nano": 0}),
+        (2.0, {"units": "2", "nano": 0}),
+        (2.5, {"units": "2", "nano": 500_000_000}),
+        (2.1, {"units": "2", "nano": 100_000_000}),
+        (0.05, {"units": "0", "nano": 50_000_000}),
+        (-1.5, {"units": "-1", "nano": -500_000_000}),
+    ])
+    def test_values(self, value, expected):
+        assert _to_quotation(value) == expected
+
+    @pytest.mark.parametrize("value", [2.0, 2.5, 0.05, 312.45, -1.5])
+    def test_round_trip(self, value):
+        assert _quotation_to_float(_to_quotation(value)) == pytest.approx(value)
