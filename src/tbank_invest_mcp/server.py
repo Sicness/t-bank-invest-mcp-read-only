@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import ssl
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,9 @@ mcp = FastMCP(
         "of the object it is in; an amount in some other currency is written as "
         "{value, currency}. Lists of positions, operations and bond events leave out fields "
         "that are zero, false or empty. "
+        "An instrument parameter takes a ticker, FIGI, ISIN or UID; TICKER_CLASSCODE "
+        "(SBER_TQBR) picks one listing when a ticker has several. Search by name with "
+        "find_instrument. "
         "Dates are UTC. A from_date/to_date given as YYYY-MM-DD covers whole days: "
         "to_date includes that day up to 23:59:59."
     ),
@@ -132,6 +136,8 @@ def _api_error(service: str, method: str, resp: httpx.Response) -> str:
         detail = str(payload["message"])
         if payload.get("description"):
             detail += f" (error code {payload['description']})"
+        if str(payload.get("description")) == "50002":  # instrument not found
+            detail += ". Name an instrument by ticker, FIGI, ISIN or UID; find_instrument searches by name"
     else:
         detail = resp.text.strip()[:300] or "no details in the response"
     return f"T-Bank API returned HTTP {resp.status_code} for {service}/{method}: {detail}"
@@ -301,6 +307,96 @@ def _to_quotation(value: float) -> dict[str, Any]:
     return {"units": str(units), "nano": round((value - units) * 1_000_000_000)}
 
 
+# ── Instrument identifiers ──────────────────────────────────────────────────
+
+_UID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+
+INSTRUMENT_KINDS = (
+    "SHARE", "BOND", "ETF", "CURRENCY", "FUTURES", "OPTION", "SP", "CLEARING_CERTIFICATE",
+    "INDEX", "COMMODITY",
+)
+
+# (identifier, kind) → the instrument it names, or None if nothing matches. Kept for the life
+# of the process: an identifier does not change what it names.
+_resolved: dict[tuple[str, str], dict | None] = {}
+
+
+def _is_uid(identifier: str) -> bool:
+    return bool(_UID_RE.fullmatch(identifier))
+
+
+async def _search(query: str, kind: str = "", tradable_only: bool = True) -> list[dict]:
+    body: dict[str, Any] = {"query": query}
+    if kind:
+        body["instrumentKind"] = _enum(kind, "INSTRUMENT_TYPE_", INSTRUMENT_KINDS)
+    if tradable_only:
+        body["apiTradeAvailableFlag"] = True
+    data = await _call("InstrumentsService", "FindInstrument", body)
+    return data.get("instruments", [])
+
+
+def _exact(instruments: list[dict], identifier: str, class_code: str = "") -> list[dict]:
+    """The hits that carry identifier as their ticker, FIGI, ISIN or UID, one per instrument."""
+    wanted = identifier.upper()
+    found: dict[str, dict] = {}
+    for i in instruments:
+        if class_code and i.get("classCode", "").upper() != class_code.upper():
+            continue
+        if wanted in (i.get(k, "").upper() for k in ("ticker", "figi", "isin", "uid")):
+            found.setdefault(i.get("uid", ""), i)
+    return list(found.values())
+
+
+async def _find_exact(identifier: str, kind: str = "") -> dict | None:
+    """The instrument a ticker, FIGI, ISIN or TICKER_CLASSCODE names, or None if none does.
+
+    Listings tradable through the API are preferred — for a share that leaves its main
+    board out of a dozen technical ones. Raises ValueError when several instruments still
+    match, naming them, rather than picking one silently.
+    """
+    identifier = identifier.strip()
+    key = (identifier.upper(), kind.upper())
+    if key in _resolved:
+        return _resolved[key]
+
+    attempts = [(identifier, "")]
+    if "_" in identifier:  # after the plain reading: tickers such as CNYRUB_TOM have one too
+        attempts.append(tuple(identifier.rsplit("_", 1)))
+    hits: list[dict] = []
+    for query, class_code in attempts:
+        for tradable_only in (True, False):
+            hits = _exact(await _search(query, kind, tradable_only), query, class_code)
+            if hits:
+                break
+        if hits:
+            break
+
+    if len(hits) > 1:
+        names = ", ".join(
+            f"{i.get('ticker')}_{i.get('classCode')} ({i.get('name')}, {i.get('instrumentType')})"
+            for i in hits[:8]
+        )
+        raise ValueError(
+            f"{identifier!r} names {len(hits)} instruments: {names}. "
+            "Pass one of these TICKER_CLASSCODE forms or the instrument's UID."
+        )
+    _resolved[key] = hits[0] if hits else None
+    return _resolved[key]
+
+
+async def _uid(identifier: str, kind: str = "") -> str:
+    """Instrument UID for a ticker, FIGI, ISIN or UID.
+
+    An identifier nothing matches is returned as it came, so the API gets to answer for it
+    the way it always has.
+    """
+    identifier = identifier.strip()
+    if not identifier or _is_uid(identifier):
+        return identifier
+    instrument = await _find_exact(identifier, kind)
+    return instrument["uid"] if instrument else identifier
+
+
 # ── Account & User ──────────────────────────────────────────────────────────
 
 
@@ -411,7 +507,7 @@ async def get_operations(
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         state: Filter by state: EXECUTED, CANCELED, PROGRESS (empty = all)
-        figi: Filter by instrument FIGI (empty = all instruments)
+        figi: Filter by instrument — FIGI, ticker, ISIN or UID (empty = all instruments)
     """
     now = datetime.now(timezone.utc)
     dt_from = _parse_date(from_date, now - timedelta(days=30))
@@ -424,7 +520,9 @@ async def get_operations(
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     if figi:
-        body["figi"] = figi
+        # This method filters by FIGI only; take it from whatever names the instrument.
+        instrument = await _find_exact(figi)
+        body["figi"] = (instrument or {}).get("figi") or figi
     data = await _call("OperationsService", "GetOperations", body)
     return _fmt(_trimmed(data, "operations"))
 
@@ -457,7 +555,7 @@ async def get_operations_by_cursor(
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         cursor: Cursor from previous response for pagination
         limit: Number of operations per page (1-1000, default: 100)
-        instrument_id: Filter by instrument FIGI or UID
+        instrument_id: Filter by instrument — ticker, FIGI, ISIN or UID
         operation_types: Comma-separated operation types (e.g. "BUY,SELL,DIVIDEND")
         state: Filter by state: EXECUTED, CANCELED, PROGRESS
         without_commissions: Exclude commission operations
@@ -477,7 +575,7 @@ async def get_operations_by_cursor(
     if cursor:
         body["cursor"] = cursor
     if instrument_id:
-        body["instrumentId"] = instrument_id
+        body["instrumentId"] = await _uid(instrument_id)
     if operation_types:
         body["operationTypes"] = [
             _enum(t, "OPERATION_TYPE_") for t in operation_types.split(",") if t.strip()
@@ -491,17 +589,88 @@ async def get_operations_by_cursor(
 # ── Instruments ──────────────────────────────────────────────────────────────
 
 
+_SEARCH_FIELDS = ("ticker", "classCode", "name", "instrumentType", "uid", "figi", "isin", "lot")
+
+
 @read_only_tool
-async def find_instrument(query: str) -> str:
+async def find_instrument(
+    query: str,
+    instrument_kind: str = "",
+    tradable_only: bool = True,
+    limit: int = 20,
+) -> str:
     """Search for instruments by text query (ticker, name, ISIN, FIGI).
 
-    Returns list of matching instruments with basic info: figi, ticker, name, type, class_code.
+    Returns {"instruments": [...], "total": N}. Each instrument has ticker, classCode, name,
+    instrumentType, uid, figi, isin and lot; forQualInvestorFlag appears when it is true and
+    apiTradeAvailableFlag when it is false. An instrument whose ticker, ISIN or FIGI equals
+    the query comes first. "total" counts every match; "note" says when the list was cut to
+    limit or when nothing tradable matched and non-tradable listings are shown instead.
+
+    A paper has many listings (one per board, most of them not tradable), and a company's
+    name also matches all its bonds — narrow the search with instrument_kind.
 
     Args:
         query: Search string (e.g. "SBER", "Газпром", "Apple")
+        instrument_kind: Only this kind — share, bond, etf, currency, futures, option, sp,
+            clearing_certificate, index, commodity (empty = any)
+        tradable_only: Only listings tradable through the API (default: true). False also
+            returns delisted papers and technical boards.
+        limit: Maximum number of instruments to return (1-200, default: 20)
     """
-    data = await _call("InstrumentsService", "FindInstrument", {"query": query})
-    return _fmt(data)
+    limit = min(max(limit, 1), 200)
+    found = await _search(query, instrument_kind, tradable_only)
+    note = ""
+    if not found and tradable_only:
+        found = await _search(query, instrument_kind, tradable_only=False)
+        if found:
+            note = "nothing tradable through the API matched; these listings are not tradable"
+
+    wanted = query.strip().upper()
+    def rank(i: dict) -> tuple[bool, bool]:
+        exact = wanted in (i.get(k, "").upper() for k in ("ticker", "figi", "isin"))
+        return (not exact, not i.get("apiTradeAvailableFlag"))
+    found.sort(key=rank)  # stable: the API's own order is kept within each group
+
+    instruments = []
+    for i in found[:limit]:
+        item = {k: i[k] for k in _SEARCH_FIELDS if k in i}
+        if i.get("forQualInvestorFlag"):
+            item["forQualInvestorFlag"] = True
+        if not i.get("apiTradeAvailableFlag"):
+            item["apiTradeAvailableFlag"] = False
+        instruments.append(item)
+
+    result: dict[str, Any] = {"instruments": instruments, "total": len(found)}
+    if len(found) > limit:
+        note = f"showing {limit} of {len(found)}; narrow the query or instrument_kind, or raise limit"
+    if note:
+        result["note"] = note
+    return _fmt(result)
+
+
+async def _instrument_ref(id: str, id_type: str, class_code: str, kind: str = "") -> dict[str, Any]:
+    """Request fields naming one instrument for the *By methods.
+
+    The API wants to be told what kind of identifier it is given and takes a ticker only
+    with its class code. A caller should not have to know either, so a UID is recognised
+    by its shape and anything else is looked up; id_type and class_code still work as before.
+    """
+    id = id.strip()
+    id_type = _enum(id_type or "FIGI", "INSTRUMENT_ID_TYPE_", ("FIGI", "TICKER", "UID", "POSITION_UID"))
+    if class_code:
+        # A class code only goes with a ticker, whatever id_type was left at.
+        if id_type == "INSTRUMENT_ID_TYPE_FIGI":
+            id_type = "INSTRUMENT_ID_TYPE_TICKER"
+        return {"idType": id_type, "id": id, "classCode": class_code}
+    if id_type in ("INSTRUMENT_ID_TYPE_UID", "INSTRUMENT_ID_TYPE_POSITION_UID"):
+        return {"idType": id_type, "id": id}
+    if _is_uid(id):
+        return {"idType": "INSTRUMENT_ID_TYPE_UID", "id": id}
+    instrument = await _find_exact(id, kind)
+    if instrument:
+        return {"idType": "INSTRUMENT_ID_TYPE_UID", "id": instrument["uid"]}
+    return {"idType": id_type, "id": id}
 
 
 @read_only_tool
@@ -515,13 +684,11 @@ async def get_instrument_by(
     Returns: name, ticker, figi, uid, lot size, currency, country, sector, trading status, etc.
 
     Args:
-        id: Instrument identifier (FIGI, ticker, or UID)
-        id_type: Type of ID — INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER (e.g. "TQBR" for Moscow Exchange shares)
+        id: Instrument ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code)
     data = await _call("InstrumentsService", "GetInstrumentBy", body)
     return _fmt(data)
 
@@ -535,13 +702,11 @@ async def get_bond_by(
     """Get detailed bond info: maturity date, coupon rate, nominal, ACI, issue size, risk level.
 
     Args:
-        id: Bond identifier (FIGI, ticker, or UID)
-        id_type: INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER
+        id: Bond ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code, "bond")
     data = await _call("InstrumentsService", "BondBy", body)
     return _fmt(data)
 
@@ -557,7 +722,7 @@ async def get_bond_coupons(
 
     Args:
         figi: Deprecated, kept for existing callers — pass the FIGI as instrument_id instead
-        instrument_id: Bond FIGI or UID (required)
+        instrument_id: Bond ticker, FIGI, ISIN or UID (required)
         from_date: Start date (YYYY-MM-DD), default: now
         to_date: End date (YYYY-MM-DD, inclusive), default: 1 year from now
     """
@@ -571,7 +736,7 @@ async def get_bond_coupons(
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     }
     if instrument_id:
-        body["instrumentId"] = instrument_id
+        body["instrumentId"] = await _uid(instrument_id, "bond")
     if figi:
         body["figi"] = figi
     data = await _call("InstrumentsService", "GetBondCoupons", body)
@@ -597,17 +762,18 @@ async def get_bond_events(
     A field of an event that is zero or empty is left out.
 
     Args:
-        instrument_id: Bond FIGI or UID
+        instrument_id: Bond ticker, FIGI, ISIN or UID
         type: Event type filter (empty = all): CPN (coupon), CALL (offer), MTY (maturity),
             CONV (conversion). The EVENT_TYPE_ prefix is optional; COUPON, MATURITY and
             CONVERSION are accepted too.
         from_date: Start date (YYYY-MM-DD), default: chosen by the API
         to_date: End date (YYYY-MM-DD, inclusive), default: chosen by the API
     """
-    body: dict[str, Any] = {"instrumentId": instrument_id}
-    if type:
+    body: dict[str, Any] = {}
+    if type:  # checked before anything is requested
         name = type.strip().upper()
         body["type"] = _enum(BOND_EVENT_ALIASES.get(name, type), "EVENT_TYPE_", BOND_EVENT_TYPES)
+    body["instrumentId"] = await _uid(instrument_id, "bond")
     if from_date:
         body["from"] = _ts(_parse_date(from_date))
     if to_date:
@@ -625,13 +791,11 @@ async def get_share_by(
     """Get detailed share (stock) info: sector, dividend yield, IPO date, issue size, country.
 
     Args:
-        id: Share identifier (FIGI, ticker, or UID)
-        id_type: INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER (e.g. "TQBR")
+        id: Share ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code, "share")
     data = await _call("InstrumentsService", "ShareBy", body)
     return _fmt(data)
 
@@ -645,13 +809,11 @@ async def get_etf_by(
     """Get detailed ETF/fund info: management fee, tracking index, rebalance frequency.
 
     Args:
-        id: ETF identifier (FIGI, ticker, or UID)
-        id_type: INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER
+        id: ETF ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code, "etf")
     data = await _call("InstrumentsService", "EtfBy", body)
     return _fmt(data)
 
@@ -665,13 +827,11 @@ async def get_currency_by(
     """Get detailed currency instrument info.
 
     Args:
-        id: Currency identifier (FIGI, ticker, or UID)
-        id_type: INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER
+        id: Currency ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code, "currency")
     data = await _call("InstrumentsService", "CurrencyBy", body)
     return _fmt(data)
 
@@ -685,13 +845,11 @@ async def get_future_by(
     """Get detailed futures contract info: expiration, basic asset, margin requirements.
 
     Args:
-        id: Future identifier (FIGI, ticker, or UID)
-        id_type: INSTRUMENT_ID_TYPE_FIGI, INSTRUMENT_ID_TYPE_TICKER, or INSTRUMENT_ID_TYPE_UID
-        class_code: Required when id_type is TICKER
+        id: Future ticker, FIGI, ISIN or UID — which one it is gets recognised automatically
+        id_type: Only needed with class_code: INSTRUMENT_ID_TYPE_TICKER. Otherwise leave the default.
+        class_code: Board of a ticker (e.g. "TQBR"), to pick one listing out of several
     """
-    body: dict[str, Any] = {"idType": id_type, "id": id}
-    if class_code:
-        body["classCode"] = class_code
+    body = await _instrument_ref(id, id_type, class_code, "futures")
     data = await _call("InstrumentsService", "FutureBy", body)
     return _fmt(data)
 
@@ -707,13 +865,13 @@ async def get_dividends(
     Returns: record date, payment date, dividend per share, yield, currency.
 
     Args:
-        instrument_id: Instrument FIGI or UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
         from_date: Start date (YYYY-MM-DD), default: 2 years ago
         to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetDividends", {
-        "instrumentId": instrument_id,
+        "instrumentId": await _uid(instrument_id),
         "from": _ts(_parse_date(from_date, now - timedelta(days=730))),
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
@@ -729,13 +887,13 @@ async def get_accrued_interests(
     """Get accrued coupon interest (NKD) history for a bond.
 
     Args:
-        instrument_id: Bond FIGI or UID
+        instrument_id: Bond ticker, FIGI, ISIN or UID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAccruedInterests", {
-        "instrumentId": instrument_id,
+        "instrumentId": await _uid(instrument_id, "bond"),
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),
     })
@@ -746,11 +904,15 @@ async def get_accrued_interests(
 async def get_asset_fundamentals(assets: str) -> str:
     """Get fundamental financial data for assets: P/E, P/BV, EPS, ROE, revenue, market cap, etc.
 
+    The API keys fundamentals by asset UID, which is not the instrument UID; whatever is
+    passed here is converted. Each item of the result carries its assetUid.
+
     Args:
-        assets: Comma-separated list of asset UIDs
+        assets: Comma-separated list of tickers, FIGIs, ISINs, instrument UIDs or asset UIDs
     """
-    asset_list = [a.strip() for a in assets.split(",") if a.strip()]
-    data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": asset_list})
+    given = [a.strip() for a in assets.split(",") if a.strip()]
+    asset_list = await asyncio.gather(*(_asset_uid_for(a) for a in given))
+    data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": list(asset_list)})
     return _fmt(data)
 
 
@@ -770,6 +932,13 @@ async def _asset_uid(instrument_uid: str) -> str:
             return ""
         raise
     return data.get("instrument", {}).get("assetUid", "")
+
+
+async def _asset_uid_for(identifier: str) -> str:
+    """Asset UID for a ticker, FIGI, ISIN, instrument UID or asset UID."""
+    uid = await _uid(identifier)
+    # A UID the instrument lookup does not know is taken to be an asset UID already.
+    return await _asset_uid(uid) or uid
 
 
 async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
@@ -822,12 +991,13 @@ async def get_consensus_forecasts(
     item, or {"error": ...} if there is none.
 
     Args:
-        instrument_id: Instrument UID or asset UID
+        instrument_id: Ticker, FIGI, ISIN, instrument UID or asset UID
         page_limit: Page size used while scanning (default: 100; a non-positive value means 100)
         max_pages: Safety cap on how many pages to scan before giving up (default: 50, at least 1)
     """
     # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
-    asset_uids = {instrument_id, await _asset_uid(instrument_id)} - {""}
+    uid = await _uid(instrument_id)
+    asset_uids = {uid, await _asset_uid(uid)} - {""}
     return _fmt(await _consensus_forecast(asset_uids, page_limit, max_pages))
 
 
@@ -939,9 +1109,9 @@ async def get_forecast_by(instrument_id: str) -> str:
     Returns: analyst name, target price, recommendation (buy/hold/sell), date.
 
     Args:
-        instrument_id: Instrument UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
     """
-    data = await _call("InstrumentsService", "GetForecastBy", {"instrumentId": instrument_id})
+    data = await _call("InstrumentsService", "GetForecastBy", {"instrumentId": await _uid(instrument_id)})
     return _fmt(data)
 
 
@@ -954,13 +1124,13 @@ async def get_asset_reports(
     """Get upcoming and past earnings report dates for an instrument's issuer.
 
     Args:
-        instrument_id: Instrument UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
         from_date: Start date (YYYY-MM-DD), default: now
         to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAssetReports", {
-        "instrumentId": instrument_id,
+        "instrumentId": await _uid(instrument_id),
         "from": _ts(_parse_date(from_date, now)),
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
@@ -1020,7 +1190,7 @@ async def get_candles(
     daily ones.
 
     Args:
-        instrument_id: Instrument FIGI or UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         interval: Candle interval — CANDLE_INTERVAL_1_MIN, CANDLE_INTERVAL_5_MIN,
@@ -1030,7 +1200,7 @@ async def get_candles(
     """
     now = datetime.now(timezone.utc)
     data = await _call("MarketDataService", "GetCandles", {
-        "instrumentId": instrument_id,
+        "instrumentId": await _uid(instrument_id),
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),
         "interval": interval,
@@ -1057,14 +1227,20 @@ async def get_candles(
     return _fmt(result)
 
 
+async def _uids(instrument_ids: str) -> list[str]:
+    """Instrument UIDs for a comma-separated list of tickers, FIGIs, ISINs or UIDs."""
+    given = [i.strip() for i in instrument_ids.split(",") if i.strip()]
+    return list(await asyncio.gather(*(_uid(i) for i in given)))
+
+
 @read_only_tool
 async def get_last_prices(instrument_ids: str) -> str:
     """Get last trade prices for one or more instruments.
 
     Args:
-        instrument_ids: Comma-separated list of FIGIs or UIDs
+        instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
-    ids = [i.strip() for i in instrument_ids.split(",") if i.strip()]
+    ids = await _uids(instrument_ids)
     data = await _call("MarketDataService", "GetLastPrices", {"instrumentId": ids})
     return _fmt(data)
 
@@ -1074,11 +1250,11 @@ async def get_order_book(instrument_id: str, depth: int = 20) -> str:
     """Get order book (market depth) for an instrument: bids, asks, last price, spread.
 
     Args:
-        instrument_id: Instrument FIGI or UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
         depth: Order book depth 1-50 (default: 20)
     """
     data = await _call("MarketDataService", "GetOrderBook", {
-        "instrumentId": instrument_id,
+        "instrumentId": await _uid(instrument_id),
         "depth": min(max(depth, 1), 50),
     })
     return _fmt(data)
@@ -1089,10 +1265,9 @@ async def get_close_prices(instrument_ids: str) -> str:
     """Get previous trading session close prices for instruments.
 
     Args:
-        instrument_ids: Comma-separated list of FIGIs or UIDs
+        instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
-    ids = [i.strip() for i in instrument_ids.split(",") if i.strip()]
-    instruments = [{"instrumentId": i} for i in ids]
+    instruments = [{"instrumentId": i} for i in await _uids(instrument_ids)]
     data = await _call("MarketDataService", "GetClosePrices", {"instruments": instruments})
     return _fmt(data)
 
@@ -1102,9 +1277,9 @@ async def get_trading_status(instrument_id: str) -> str:
     """Get current trading status for an instrument: is it tradeable, auction phase, etc.
 
     Args:
-        instrument_id: Instrument FIGI or UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
     """
-    data = await _call("MarketDataService", "GetTradingStatus", {"instrumentId": instrument_id})
+    data = await _call("MarketDataService", "GetTradingStatus", {"instrumentId": await _uid(instrument_id)})
     return _fmt(data)
 
 
@@ -1129,7 +1304,7 @@ async def get_tech_analysis(
     lowerBand (BB).
 
     Args:
-        instrument_id: Instrument UID
+        instrument_id: Instrument ticker, FIGI, ISIN or UID
         indicator_type: INDICATOR_TYPE_SMA, INDICATOR_TYPE_EMA, INDICATOR_TYPE_RSI,
                        INDICATOR_TYPE_MACD, INDICATOR_TYPE_BB
         from_date: Start date (YYYY-MM-DD), default: 90 days ago
@@ -1148,7 +1323,7 @@ async def get_tech_analysis(
     """
     now = datetime.now(timezone.utc)
     body: dict[str, Any] = {
-        "instrumentUid": instrument_id,
+        "instrumentUid": await _uid(instrument_id),
         "indicatorType": indicator_type,
         "from": _ts(_parse_date(from_date, now - timedelta(days=90))),
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),

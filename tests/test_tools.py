@@ -14,10 +14,28 @@ def set_token(monkeypatch):
     monkeypatch.setenv("TBANK_INVEST_TOKEN", "test-token")
 
 
+@pytest.fixture(autouse=True)
+def forget_resolved_instruments():
+    """Identifier lookups are cached for the life of the process; tests must not share them."""
+    srv._resolved.clear()
+    yield
+    srv._resolved.clear()
+
+
 def make_call_mock(return_value=None):
     if return_value is None:
         return_value = {}
     return AsyncMock(return_value=return_value)
+
+
+def route(**by_method):
+    """_call mock answering by API method name; a value may be a function of the request body.
+    Methods not named answer {} — which for FindInstrument means "nothing matches"."""
+    async def router(service, method, body=None):
+        answer = by_method.get(method, {})
+        return answer(body) if callable(answer) else answer
+
+    return AsyncMock(side_effect=router)
 
 
 SBER = {
@@ -27,6 +45,10 @@ SBER = {
     "forQualInvestorFlag": False, "forIisFlag": True, "weekendFlag": True, "blockedTcaFlag": False,
     "positionUid": "41eb2102-5333-4713-bf15-72b204c4bf7b",
 }
+SBERP = {**SBER, "ticker": "SBERP", "name": "Сбер Банк - привилегированные акции",
+         "uid": "c190ff1f-1447-4227-b543-316332699ca5", "figi": "BBG0047315Y7", "isin": "RU0009029557"}
+SBER_OTC = {**SBER, "classCode": "SPEQ", "uid": "11111111-2222-3333-4444-555555555555",
+            "figi": "TCS009029540", "apiTradeAvailableFlag": False}
 
 
 # ── UsersService ─────────────────────────────────────────────────────────────
@@ -563,6 +585,8 @@ def make_paged_call_mock(pages, asset_uids=None):
             if body["id"] not in asset_uids:
                 raise http_error(404)
             return {"instrument": {"uid": body["id"], "assetUid": asset_uids[body["id"]]}}
+        if method == "FindInstrument":
+            return {"instruments": []}
         page_number = body["paging"]["pageNumber"]
         items, total_count = pages[page_number]
         return {"items": items, "page": {"totalCount": total_count}}
@@ -1348,7 +1372,7 @@ class TestReturnFormatting:
     async def test_cyrillic_not_escaped_in_output(self):
         mock = make_call_mock({"name": "Газпром"})
         with patch.object(srv, "_call", mock):
-            result = await srv.find_instrument("test")
+            result = await srv.get_user_info()
         assert "Газпром" in result
         assert "\\u" not in result
 
@@ -1357,6 +1381,255 @@ class TestReturnFormatting:
         with patch.object(srv, "_call", mock):
             result = json.loads(await srv.get_last_prices("e6123145-9665-43e0-8413-cd61b8aa9b13"))
         assert result == {"lastPrices": [{"figi": "F", "price": 274.27}]}
+
+
+# ── Instrument identifiers ────────────────────────────────────────────────────
+
+
+def search_results(*by_flag):
+    """FindInstrument answer that honours apiTradeAvailableFlag the way the API does."""
+    def answer(body):
+        hits = [i for i in by_flag if i.get("apiTradeAvailableFlag") or not body.get("apiTradeAvailableFlag")]
+        return {"instruments": hits}
+    return answer
+
+
+class TestInstrumentResolution:
+    async def test_uid_is_taken_as_is_without_a_lookup(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid(SBER["uid"]) == SBER["uid"]
+        mock.assert_not_called()
+
+    @pytest.mark.parametrize("identifier", ["SBER", "sber", " SBER ", "BBG004730N88", "RU0009029540"])
+    async def test_ticker_figi_and_isin_resolve_to_the_uid(self, identifier):
+        mock = route(FindInstrument=search_results(SBER, SBERP, SBER_OTC))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid(identifier) == SBER["uid"]
+
+    async def test_only_exact_matches_count(self):
+        # "SBER" also finds SBERP and every Sber bond; a name is not an identifier.
+        mock = route(FindInstrument=search_results(SBERP))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER") == "SBER"
+
+    async def test_tradable_listing_is_preferred(self):
+        mock = route(FindInstrument=search_results(SBER_OTC, SBER))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER") == SBER["uid"]
+        assert calls_to(mock, "FindInstrument") == [{"query": "SBER", "apiTradeAvailableFlag": True}]
+
+    async def test_falls_back_to_non_tradable_listings(self):
+        mock = route(FindInstrument=search_results(SBER_OTC))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER") == SBER_OTC["uid"]
+        assert calls_to(mock, "FindInstrument") == [
+            {"query": "SBER", "apiTradeAvailableFlag": True},
+            {"query": "SBER"},
+        ]
+
+    async def test_several_matches_are_reported_not_guessed(self):
+        other_board = {**SBER, "classCode": "SMAL", "uid": "99999999-2222-3333-4444-555555555555"}
+        mock = route(FindInstrument=search_results(SBER, other_board))
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError) as exc_info:
+                await srv._uid("SBER")
+        message = str(exc_info.value)
+        assert "SBER_TQBR" in message and "SBER_SMAL" in message
+        assert "UID" in message
+
+    async def test_ticker_with_class_code_picks_a_listing(self):
+        other_board = {**SBER, "classCode": "SMAL", "uid": "99999999-2222-3333-4444-555555555555"}
+
+        def answer(body):
+            return {"instruments": [SBER, other_board] if body["query"] == "SBER" else []}
+
+        mock = route(FindInstrument=answer)
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER_SMAL") == other_board["uid"]
+
+    async def test_ticker_that_contains_an_underscore(self):
+        cny = {"ticker": "CNYRUB_TOM", "classCode": "CETS", "uid": "4587ab1d-a9c9-4910-a0d6-86c7b9c42510",
+               "figi": "BBG0013HRTL0", "isin": "", "apiTradeAvailableFlag": True}
+        mock = route(FindInstrument=search_results(cny))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("CNYRUB_TOM") == cny["uid"]
+
+    async def test_unknown_identifier_is_passed_through(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("NOPE") == "NOPE"
+
+    async def test_lookups_are_cached_including_misses(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv._uid("SBER")
+            await srv._uid("sber")
+            await srv._uid("NOPE")
+            await srv._uid("NOPE")
+        queries = [b["query"] for b in calls_to(mock, "FindInstrument")]
+        assert queries == ["SBER", "NOPE", "NOPE"]  # one hit, then one tradable + one full miss
+
+    async def test_kind_narrows_the_search(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv._uid("SBER", "share")
+        assert calls_to(mock, "FindInstrument")[0] == {
+            "query": "SBER", "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True,
+        }
+
+    @pytest.mark.parametrize("call, method, key", [
+        (lambda: srv.get_candles("SBER"), "GetCandles", "instrumentId"),
+        (lambda: srv.get_order_book("SBER"), "GetOrderBook", "instrumentId"),
+        (lambda: srv.get_trading_status("SBER"), "GetTradingStatus", "instrumentId"),
+        (lambda: srv.get_dividends("SBER"), "GetDividends", "instrumentId"),
+        (lambda: srv.get_forecast_by("SBER"), "GetForecastBy", "instrumentId"),
+        (lambda: srv.get_asset_reports("SBER"), "GetAssetReports", "instrumentId"),
+        (lambda: srv.get_tech_analysis("SBER", "RSI"), "GetTechAnalysis", "instrumentUid"),
+        (lambda: srv.get_operations_by_cursor("acc", instrument_id="SBER"), "GetOperationsByCursor", "instrumentId"),
+    ])
+    async def test_tools_accept_a_ticker(self, call, method, key):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await call()
+        assert call_body(mock, method)[key] == SBER["uid"]
+
+    async def test_lists_of_identifiers(self):
+        mock = route(FindInstrument=lambda body: {"instruments": [i for i in (SBER, SBERP) if i["ticker"] == body["query"]]})
+        with patch.object(srv, "_call", mock):
+            await srv.get_last_prices(f"SBER, {SBERP['uid']},SBERP")
+            await srv.get_close_prices("SBER,SBERP")
+        assert call_body(mock, "GetLastPrices") == {"instrumentId": [SBER["uid"], SBERP["uid"], SBERP["uid"]]}
+        assert call_body(mock, "GetClosePrices") == {
+            "instruments": [{"instrumentId": SBER["uid"]}, {"instrumentId": SBERP["uid"]}],
+        }
+
+    async def test_operations_figi_filter_takes_any_identifier(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations("acc", figi="SBER")
+        assert call_body(mock, "GetOperations")["figi"] == "BBG004730N88"
+
+    async def test_bond_tools_search_among_bonds(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_events("SU26238RMFS4")
+        assert calls_to(mock, "FindInstrument")[0]["instrumentKind"] == "INSTRUMENT_TYPE_BOND"
+
+
+class TestInstrumentRef:
+    """How the *By tools tell the API which instrument is meant."""
+
+    async def test_uid_is_recognised_by_its_shape(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_instrument_by(SBER["uid"])
+        assert call_body(mock, "GetInstrumentBy") == {"idType": "INSTRUMENT_ID_TYPE_UID", "id": SBER["uid"]}
+        assert calls_to(mock, "FindInstrument") == []
+
+    async def test_ticker_is_looked_up_among_the_tools_kind(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv.get_share_by("SBER")
+        assert calls_to(mock, "FindInstrument")[0]["instrumentKind"] == "INSTRUMENT_TYPE_SHARE"
+        assert call_body(mock, "ShareBy") == {"idType": "INSTRUMENT_ID_TYPE_UID", "id": SBER["uid"]}
+
+    async def test_class_code_means_a_ticker_even_with_the_default_id_type(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_share_by("SBER", class_code="TQBR")
+        assert call_body(mock, "ShareBy") == {
+            "idType": "INSTRUMENT_ID_TYPE_TICKER", "id": "SBER", "classCode": "TQBR",
+        }
+        assert calls_to(mock, "FindInstrument") == []
+
+    async def test_explicit_uid_type_is_not_looked_up(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_by("anything", id_type="INSTRUMENT_ID_TYPE_UID")
+        assert call_body(mock, "BondBy") == {"idType": "INSTRUMENT_ID_TYPE_UID", "id": "anything"}
+        assert calls_to(mock, "FindInstrument") == []
+
+    async def test_short_id_type_name(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_by("anything", id_type="uid")
+        assert call_body(mock, "BondBy")["idType"] == "INSTRUMENT_ID_TYPE_UID"
+
+    async def test_unknown_identifier_goes_to_the_api_as_before(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_etf_by("BBG000000001")
+        assert call_body(mock, "EtfBy") == {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": "BBG000000001"}
+
+
+class TestFindInstrumentShaping:
+    async def test_searches_tradable_listings_by_default(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv.find_instrument("SBER")
+        assert calls_to(mock, "FindInstrument") == [{"query": "SBER", "apiTradeAvailableFlag": True}]
+
+    async def test_kind_filter(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            await srv.find_instrument("Сбер", instrument_kind="share")
+        assert calls_to(mock, "FindInstrument")[0]["instrumentKind"] == "INSTRUMENT_TYPE_SHARE"
+
+    async def test_unknown_kind_is_rejected(self):
+        with patch.object(srv, "_call", route()):
+            with pytest.raises(ValueError, match="SHARE, BOND"):
+                await srv.find_instrument("Сбер", instrument_kind="stock")
+
+    async def test_instruments_keep_only_what_identifies_them(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("SBER"))
+        assert result == {"total": 1, "instruments": [{
+            "ticker": "SBER", "classCode": "TQBR", "name": "Сбер Банк", "instrumentType": "share",
+            "uid": SBER["uid"], "figi": "BBG004730N88", "isin": "RU0009029540", "lot": 1,
+        }]}
+
+    async def test_exact_match_comes_first(self):
+        mock = route(FindInstrument=search_results(SBERP, SBER))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("sber"))
+        assert [i["ticker"] for i in result["instruments"]] == ["SBER", "SBERP"]
+
+    async def test_non_tradable_listings_on_request(self):
+        mock = route(FindInstrument=search_results(SBER, SBER_OTC))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("SBER", tradable_only=False))
+        assert calls_to(mock, "FindInstrument") == [{"query": "SBER"}]
+        assert [i.get("apiTradeAvailableFlag") for i in result["instruments"]] == [None, False]
+
+    async def test_falls_back_to_non_tradable_and_says_so(self):
+        mock = route(FindInstrument=search_results(SBER_OTC))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("SBER"))
+        assert result["total"] == 1
+        assert result["instruments"][0]["apiTradeAvailableFlag"] is False
+        assert "not tradable" in result["note"]
+
+    async def test_qualified_investor_flag_shown_when_set(self):
+        mock = route(FindInstrument=search_results({**SBER, "forQualInvestorFlag": True}))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("SBER"))
+        assert result["instruments"][0]["forQualInvestorFlag"] is True
+
+    async def test_limit_cuts_the_list_and_says_so(self):
+        many = [{**SBER, "ticker": f"T{n}", "uid": f"uid-{n}"} for n in range(30)]
+        mock = route(FindInstrument=search_results(*many))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("Сбер", limit=5))
+        assert len(result["instruments"]) == 5
+        assert result["total"] == 30
+        assert "5 of 30" in result["note"]
+
+    async def test_nothing_found(self):
+        with patch.object(srv, "_call", route()):
+            result = json.loads(await srv.find_instrument("NOPE"))
+        assert result == {"instruments": [], "total": 0}
 
 
 # ── Output shaping ────────────────────────────────────────────────────────────
@@ -1510,3 +1783,30 @@ class TestCandleRows:
         with patch.object(srv, "_call", make_call_mock(data)):
             result = await srv.get_candles(SBER["uid"])
         assert len(result) < len(json.dumps(data, separators=(",", ":"))) / 4
+
+
+class TestAssetFundamentalsIdentifiers:
+    async def test_ticker_and_instrument_uid_become_asset_uids(self):
+        instrument_uid = "aaaaaaaa-1111-2222-3333-444444444444"
+        asset_of = {SBER["uid"]: "asset-sber", instrument_uid: "asset-other"}
+
+        def by_uid(body):
+            if body["id"] not in asset_of:
+                raise http_error(404)
+            return {"instrument": {"assetUid": asset_of[body["id"]]}}
+
+        mock = route(FindInstrument=search_results(SBER), GetInstrumentBy=by_uid)
+        with patch.object(srv, "_call", mock):
+            await srv.get_asset_fundamentals(f"SBER, {instrument_uid}")
+        assert call_body(mock, "GetAssetFundamentals") == {"assets": ["asset-sber", "asset-other"]}
+
+    async def test_asset_uid_is_kept(self):
+        asset_uid = "40d89385-a03a-4659-bf4e-d3ecba011782"
+
+        def not_an_instrument(body):
+            raise http_error(404)
+
+        mock = route(GetInstrumentBy=not_an_instrument)
+        with patch.object(srv, "_call", mock):
+            await srv.get_asset_fundamentals(asset_uid)
+        assert call_body(mock, "GetAssetFundamentals") == {"assets": [asset_uid]}

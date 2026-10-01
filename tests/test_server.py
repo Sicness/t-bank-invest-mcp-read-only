@@ -70,13 +70,13 @@ class TestServerInfo:
 
 class TestCallToolResult:
     async def test_response_is_sent_once_as_compact_json(self):
-        data = {"instruments": [{"ticker": "SBER", "name": "Сбер Банк"}]}
+        data = {"accounts": [{"id": "1", "name": "Брокерский счёт"}]}
         with patch.object(srv, "_call", AsyncMock(return_value=data)):
-            result = await srv.mcp.call_tool("find_instrument", {"query": "SBER"})
+            result = await srv.mcp.call_tool("get_accounts", {})
         # A (content, structuredContent) tuple here would mean the payload goes out twice.
         assert isinstance(result, list)
         assert len(result) == 1
-        assert result[0].text == '{"instruments":[{"ticker":"SBER","name":"Сбер Банк"}]}'
+        assert result[0].text == '{"accounts":[{"id":"1","name":"Брокерский счёт"}]}'
         assert json.loads(result[0].text) == data
 
     async def test_api_error_reaches_the_client_with_its_message(self):
