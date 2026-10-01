@@ -101,7 +101,7 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 
 Users install with `uvx` straight from this repository (see `README.md`), so the wheel must be self-contained: anything the server reads at runtime, like the pinned CA, has to live inside `src/tbank_invest_mcp/`. The console script name, the package name and the `tbank_invest_mcp.server:main` entry point are part of the install contract — existing client configs point at them.
 
-To release: set `version` in `pyproject.toml` to the release number, commit, then tag that commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` refuses a tag that differs from the version, builds sdist and wheel, runs the test suite against the installed wheel, publishes to PyPI through Trusted Publishing (the `pypi` environment; no API token is stored) and creates a GitHub Release with generated notes.
+To release: set `version` in `pyproject.toml` to the release number, commit, push `main`, then tag that commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` refuses a tag that is not on `main` or that differs from the version, builds sdist and wheel, runs the test suite against the installed wheel, publishes to PyPI through Trusted Publishing (the `pypi` environment; no API token is stored) and creates a GitHub Release with generated notes — marked as a pre-release when the version is a dev, alpha, beta or rc one.
 
 The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0`. Semantic versioning applies to the tool contract: minor for new tools and parameters, patch for fixes. A major bump would mean a renamed or removed tool or parameter or a changed output shape, and that is not planned — people already run this server from `main`.
 
