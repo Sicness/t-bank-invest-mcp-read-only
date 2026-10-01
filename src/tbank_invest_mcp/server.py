@@ -537,27 +537,48 @@ async def get_asset_fundamentals(assets: str) -> str:
     return _fmt(data)
 
 
-async def _consensus_forecast(ids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
-    """Scan GetConsensusForecasts pages for the item whose uid or assetUid is in ids.
+async def _asset_uid(instrument_uid: str) -> str:
+    """Asset UID of an instrument, or "" if instrument_uid is not a known instrument UID.
+
+    Fundamentals and consensus forecasts are keyed by asset UID, which is a different
+    identifier from the instrument UID that FindInstrument and the *By lookups return.
+    """
+    try:
+        data = await _call("InstrumentsService", "GetInstrumentBy", {
+            "idType": "INSTRUMENT_ID_TYPE_UID",
+            "id": instrument_uid,
+        })
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return ""
+        raise
+    return data.get("instrument", {}).get("assetUid", "")
+
+
+async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
+    """Scan GetConsensusForecasts pages for the item whose assetUid is in asset_uids.
 
     Returns the item, or {"error": ...} saying whether the whole list was scanned or the
     scan was cut short by max_pages.
     """
-    label = " / ".join(sorted(ids))
+    if not asset_uids:
+        return {"error": "No asset UID to look a consensus forecast up by"}
+    label = " / ".join(sorted(asset_uids))
     for page_number in range(max_pages):
         data = await _call("InstrumentsService", "GetConsensusForecasts", {
             "paging": {"limit": page_limit, "pageNumber": page_number},
         })
         for item in data.get("items", []):
-            if item.get("uid") in ids or item.get("assetUid") in ids:
+            # An item's own "uid" identifies the forecast record, not the instrument.
+            if item.get("assetUid") in asset_uids:
                 return item
 
         total_count = data.get("page", {}).get("totalCount", 0)
         if (page_number + 1) * page_limit >= total_count:
-            return {"error": f"No consensus forecast found for {label}"}
+            return {"error": f"No consensus forecast found for asset {label}"}
 
     return {"error": (
-        f"No consensus forecast found for {label} in the first {max_pages} pages; "
+        f"No consensus forecast found for asset {label} in the first {max_pages} pages; "
         "the scan stopped at max_pages before reaching the end of the list — raise max_pages"
     )}
 
@@ -572,15 +593,18 @@ async def get_consensus_forecasts(
     number of analysts.
 
     GetConsensusForecasts has no server-side instrument filter — it only returns pages of
-    forecasts for the whole instrument universe. This scans pages internally and returns
-    just the item matching instrument_id, or {"error": ...} if there is none.
+    forecasts for the whole instrument universe, keyed by asset UID. This resolves
+    instrument_id to its asset UID, scans pages internally and returns just the matching
+    item, or {"error": ...} if there is none.
 
     Args:
-        instrument_id: Instrument UID or asset UID (matched against each item's uid and asset_uid)
+        instrument_id: Instrument UID or asset UID
         page_limit: Page size used while scanning (default: 100)
         max_pages: Safety cap on how many pages to scan before giving up (default: 50)
     """
-    return _fmt(await _consensus_forecast({instrument_id}, page_limit, max_pages))
+    # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
+    asset_uids = {instrument_id, await _asset_uid(instrument_id)} - {""}
+    return _fmt(await _consensus_forecast(asset_uids, page_limit, max_pages))
 
 
 def _pick_instrument(instruments: list[dict], query: str, class_code: str = "") -> dict | None:
@@ -626,12 +650,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
         return _fmt({"error": f"No share found for ticker={ticker!r}, class_code={class_code!r}"})
     uid = instrument.get("uid", "")
 
-    # Fundamentals and consensus forecasts are keyed by asset UID, which FindInstrument omits.
-    details = await _call("InstrumentsService", "GetInstrumentBy", {
-        "idType": "INSTRUMENT_ID_TYPE_UID",
-        "id": uid,
-    })
-    asset_uid = details.get("instrument", {}).get("assetUid", "")
+    asset_uid = await _asset_uid(uid)
 
     async def fundamentals_for_asset() -> dict:
         if not asset_uid:
@@ -650,7 +669,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
             "to": _ts(now),
             "interval": "CANDLE_INTERVAL_DAY",
         }),
-        _consensus_forecast({i for i in (uid, asset_uid) if i}),
+        _consensus_forecast({asset_uid} - {""}),
     )
 
     # The change is measured from the close before the first of the last candle_days sessions.
