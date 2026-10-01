@@ -35,12 +35,14 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 
 | Helper | Purpose |
 |---|---|
-| `_get_token()` / `_headers()` | Bearer auth from `TBANK_INVEST_TOKEN`; raises `ValueError` if unset |
-| `_ssl_context()` / `_get_client()` | pinned-CA TLS context; lazily created module-level client (30 s timeout) |
+| `_get_token()` / `_headers()` | Bearer auth from `TBANK_INVEST_TOKEN`, stripped of surrounding whitespace; raises `ValueError` if unset or malformed, without echoing the value |
+| `_ssl_context()` / `_get_client()` | pinned-CA TLS context; lazily created module-level client (`TIMEOUT_SECONDS`) |
 | `read_only_tool(fn)` | the only way a tool is registered: `readOnlyHint`, dedented docstring as description, text-only output |
-| `_call(service, method, body)` | the only place that does HTTP; returns `.json()`, or raises `httpx.HTTPStatusError` whose text is `_api_error(...)` |
+| `_call(service, method, body)` | the only place that does HTTP; returns `.json()`, or re-raises the httpx error with a text written for the model: `_api_error(...)` for an HTTP status, `_transport_error(...)` for a timeout or network failure |
 | `_api_error(service, method, resp)` | the error line the model reads: HTTP status, method, the API's `message` and error code |
-| `_ts(dt)` / `_parse_date(s, default)` | UTC datetime ↔ RFC 3339; accepts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, with or without `Z` |
+| `_transport_error(service, method, exc, token)` | the same for failures with no HTTP status; httpx timeouts have an empty message, and the token is masked in whatever the error quotes |
+| `_ts(dt)` / `_parse_date(s, default, end_of_day=False)` | UTC datetime ↔ RFC 3339; accepts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, with or without `Z`; `end_of_day=True` turns a bare date into 23:59:59 of that day |
+| `_enum(value, prefix, allowed=())` | full enum name from a value given with or without its prefix, in any case; with `allowed`, rejects an unknown value |
 | `_fmt(data)` | compact `json.dumps(..., ensure_ascii=False)` — what every tool returns |
 | `_quotation_to_float(q)` / `_to_quotation(value)` | `{units, nano}` → float (`None` for a missing value), and a number → `{units, nano}` for a request body |
 | `_asset_uid(instrument_uid)` | instrument UID → asset UID via `GetInstrumentBy`; `""` on 404 |
@@ -55,10 +57,10 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 - **Every tool is registered with `@read_only_tool`, never with `mcp.tool()` directly.** It marks the tool `readOnlyHint` for the client — which is what lets a client skip confirmation prompts — and turns off FastMCP's structured output: tools return a JSON string, and FastMCP would otherwise send that string a second time wrapped in `structuredContent`. `tests/test_server.py` fails if a tool bypasses it.
 - **Most tools are thin pass-throughs**: build the body, `_call`, `return _fmt(data)` — the raw API response with its camelCase keys. Only composite tools shape their own output (`get_stock_snapshot`, `get_consensus_forecasts`); those use snake_case keys for what they add.
 - **Parameters are flat strings, ints and bools.** Lists arrive as comma-separated strings and are split and stripped in the tool (`assets`, `instrument_ids`, `operation_types`). Optional parameters default to `""` and are left out of the body when empty.
-- **Dates** come in as strings through `_parse_date`, each tool supplying its own default window (documented in its docstring) relative to `datetime.now(timezone.utc)`.
-- **Enums** go to the API as full prefixed strings (`CANDLE_INTERVAL_DAY`, `INSTRUMENT_ID_TYPE_UID`, `INDICATOR_TYPE_RSI`) and most tools expect the caller to pass them that way. The exceptions add the prefix themselves: `state` (`EXECUTED` → `OPERATION_STATE_EXECUTED`) and `operation_types` (`BUY` → `OPERATION_TYPE_BUY`). `get_portfolio` sends currency as an integer (RUB 0, USD 1, EUR 2).
+- **Dates** come in as strings through `_parse_date`, each tool supplying its own default window (documented in its docstring) relative to `datetime.now(timezone.utc)`. They are UTC. Every `to_date` is parsed with `end_of_day=True`, so a range given in whole days includes its last day and `from_date == to_date` means that one day, not an empty range.
+- **Enums** go to the API as full prefixed strings (`CANDLE_INTERVAL_DAY`, `INSTRUMENT_ID_TYPE_UID`, `INDICATOR_TYPE_RSI`) and most tools expect the caller to pass them that way. The filters that take short names go through `_enum`, which accepts the value with or without its prefix: `state` (`EXECUTED` → `OPERATION_STATE_EXECUTED`), `operation_types` (`BUY` → `OPERATION_TYPE_BUY`) and the bond event `type` (`CPN` → `EVENT_TYPE_CPN`). Where the enum is small, pass `allowed` so that an unknown value is an error here — the API would silently ignore it and return unfiltered data. `get_portfolio` sends currency as an integer (RUB 0, USD 1, EUR 2) and rejects anything else for the same reason.
 - **Out-of-range numbers are clamped**, not rejected (`limit` 1–1000, order book `depth` 1–50).
-- **Errors.** HTTP failures propagate from `_call` as `httpx.HTTPStatusError`, and bad arguments raise `ValueError`; FastMCP reports either to the client as a tool error, and the exception's text is all the model gets to correct itself with. So `_call` puts the API's own explanation there (`T-Bank API returned HTTP 404 for InstrumentsService/GetInstrumentBy: Instrument not found (error code 50002)`); write `ValueError` messages to the same standard. "Looked and found nothing" is a normal result instead: the composite tools return `{"error": "..."}`.
+- **Errors.** HTTP failures propagate from `_call` as `httpx.HTTPStatusError`, and bad arguments raise `ValueError`; FastMCP reports either to the client as a tool error, and the exception's text is all the model gets to correct itself with. So `_call` puts the API's own explanation there (`T-Bank API returned HTTP 404 for InstrumentsService/GetInstrumentBy: Instrument not found (error code 50002)`), and words timeouts and network failures itself; write `ValueError` messages to the same standard. An error text must never contain the token — it goes into the model's context and the conversation log. "Looked and found nothing" is a normal result instead: the composite tools return `{"error": "..."}`.
 - **Nothing may write to stdout.** The server speaks MCP over stdio, so a stray `print` corrupts the protocol stream.
 
 ## T-Bank API facts worth knowing
@@ -68,16 +70,19 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 - Instrument identifiers: FIGI, ticker (needs `class_code`, e.g. `TQBR`), or UID. Most market-data methods take `instrumentId` (FIGI or UID); `GetTechAnalysis` takes `instrumentUid` (UID only).
 - **Instrument UID ≠ asset UID.** One asset (a company's share) has many instruments (listings). `FindInstrument` and the `*By` lookups return the instrument UID; `GetAssetFundamentals` and consensus forecasts are keyed by asset UID (`assetUid` in the `GetInstrumentBy` response). A consensus forecast item's own `uid` is the forecast record's id, not an instrument.
 - `FindInstrument` returns every listing of a paper — delisted and non-tradable class codes included — and not in relevance order: the first hit for `SBER` is not SBER on TQBR. Narrow with `instrumentKind`, an exact ticker match and `apiTradeAvailableFlag`.
-- `GetConsensusForecasts` has no per-instrument filter, only paging over the whole list (on the order of a hundred items).
+- `GetConsensusForecasts` has no per-instrument filter, only paging over the whole list (on the order of a hundred items). A non-positive paging `limit` is answered with pages of 100.
+- **An enum filter value the API does not know is silently ignored**, not rejected: `GetBondEvents` with `type: "COUPON"` returns every event, exactly as with no filter. The real names are `EVENT_TYPE_CPN`, `_CALL`, `_MTY`, `_CONV`.
+- `GetBondEvents` without `from`/`to` covers only a few years around today; a bond's maturity shows up only with an explicit range.
+- A range's `to` may lie in the future. A daily candle is stamped 00:00 UTC of its day, and today's has `isComplete: false` while the session is open — its `close` is the current price.
 - Errors come as `{"code", "message", "description"}`, where `description` is T-Bank's numeric error code (listed in `src/docs/errors.md` of the same repository). An unknown id gives HTTP 404 with `{"code": 5, "message": "Instrument not found", "description": "50002"}`.
 - `GetTechAnalysis` has its own interval enum (`INDICATOR_INTERVAL_ONE_DAY`, …) and rejects the `CANDLE_INTERVAL_*` names of `GetCandles`. It also rejects `INDICATOR_TYPE_BB` without `deviation` and `INDICATOR_TYPE_MACD` without `smoothing`. MACD gives the same result with or without `length`; SMA is rejected without it.
 
 ## Tests
 
 - `tests/test_tools.py` — every tool. `_call` is replaced with an `AsyncMock` (`patch.object(srv, "_call", mock)`), then the test asserts on `mock.call_args[0]` → `(service, method, body)` and on the returned JSON. Tools that make several calls use a router mock keyed by method name (`make_paged_call_mock`, `make_snapshot_call_mock`).
-- `tests/test_call.py` — `_call` itself against a mocked `AsyncClient`: URL, headers, body, error propagation and the error text (those tests use real `httpx.Response` objects). It resets `server._client` around each test because the client is module-level.
+- `tests/test_call.py` — `_call` itself against a mocked `AsyncClient`: URL, headers, body, error propagation and the error text, for HTTP statuses (those tests use real `httpx.Response` objects) and for timeouts and network failures. It resets `server._client` around each test because the client is module-level.
 - `tests/test_ssl.py` — the pinned CA, the fingerprint guard, the `TBANK_CA_BUNDLE` override.
-- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_fmt`, `_to_quotation`.
+- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_enum`, `_fmt`, `_to_quotation`.
 - `tests/test_server.py` — what an MCP client receives, through `mcp.list_tools()` and `mcp.call_tool()`: every tool registered and marked read-only, descriptions, the reported server version, the shape of a result and of an error.
 
 `asyncio_mode = "auto"`, so async tests need no marker.

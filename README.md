@@ -131,7 +131,7 @@ uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-inv
 | `get_currency_by` | Информация о валютном инструменте |
 | `get_future_by` | Информация о фьючерсном контракте |
 | `get_bond_coupons` | Купонный календарь облигации |
-| `get_bond_events` | События облигации (амортизации, оферты) |
+| `get_bond_events` | События облигации: купоны, оферты, погашение, конвертации; фильтр по типу и периоду |
 | `get_dividends` | История и будущие дивиденды |
 | `get_accrued_interests` | НКД (накопленный купонный доход) |
 | `get_asset_fundamentals` | P/E, EPS, ROE, капитализация |

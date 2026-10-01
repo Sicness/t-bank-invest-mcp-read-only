@@ -39,7 +39,9 @@ mcp = FastMCP(
         "instruments, market data, and orders. All monetary values use MoneyValue format: "
         "units (integer part) + nano (fractional part, 10^-9). "
         "To convert: value = units + nano / 1_000_000_000. "
-        "Quotation format is the same but without currency."
+        "Quotation format is the same but without currency. "
+        "Dates are UTC. A from_date/to_date given as YYYY-MM-DD covers whole days: "
+        "to_date includes that day up to 23:59:59."
     ),
 )
 # FastMCP takes no version and would report the MCP SDK's own version as the server's.
@@ -168,15 +170,41 @@ def _ts(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_date(s: str | None, default: datetime | None = None) -> datetime | None:
+def _parse_date(
+    s: str | None, default: datetime | None = None, *, end_of_day: bool = False
+) -> datetime | None:
+    """Parse a UTC date or datetime string; an empty one gives default.
+
+    end_of_day is for the end of a range: a date without a time then means 23:59:59 of that
+    day, so that "to 2024-01-31" includes the 31st. A string with a time is taken as is.
+    """
     if not s:
         return default
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+    s = s.strip()
+    try:
+        day = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    else:
+        return day + timedelta(days=1, seconds=-1) if end_of_day else day
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     raise ValueError(f"Cannot parse date: {s!r}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format.")
+
+
+def _enum(value: str, prefix: str, allowed: tuple[str, ...] = ()) -> str:
+    """Full enum name for the API from a value given with or without its prefix, in any case.
+
+    allowed lists the valid short names for enums small enough to check here: the API
+    silently ignores a filter value it does not know instead of rejecting it.
+    """
+    name = value.strip().upper().removeprefix(prefix)
+    if allowed and name not in allowed:
+        raise ValueError(f"Unknown value {value!r}; expected one of: {', '.join(allowed)}")
+    return prefix + name
 
 
 def _fmt(data: Any) -> str:
@@ -244,9 +272,10 @@ async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
         currency: Portfolio currency — RUB, USD, or EUR (default: RUB)
     """
     currency_map = {"RUB": 0, "USD": 1, "EUR": 2}
-    body: dict[str, Any] = {"accountId": account_id}
-    if currency.upper() in currency_map:
-        body["currency"] = currency_map[currency.upper()]
+    code = currency.strip().upper()
+    if code not in currency_map:
+        raise ValueError(f"currency must be one of {', '.join(currency_map)}, got {currency!r}")
+    body: dict[str, Any] = {"accountId": account_id, "currency": currency_map[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
     return _fmt(data)
 
@@ -277,6 +306,8 @@ async def get_withdraw_limits(account_id: str) -> str:
 
 # ── Operations ───────────────────────────────────────────────────────────────
 
+OPERATION_STATES = ("EXECUTED", "CANCELED", "PROGRESS")
+
 
 @read_only_tool
 async def get_operations(
@@ -296,20 +327,20 @@ async def get_operations(
     Args:
         account_id: Account ID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
-        to_date: End date (YYYY-MM-DD), default: now
+        to_date: End date (YYYY-MM-DD, inclusive), default: now
         state: Filter by state: EXECUTED, CANCELED, PROGRESS (empty = all)
         figi: Filter by instrument FIGI (empty = all instruments)
     """
     now = datetime.now(timezone.utc)
     dt_from = _parse_date(from_date, now - timedelta(days=30))
-    dt_to = _parse_date(to_date, now)
+    dt_to = _parse_date(to_date, now, end_of_day=True)
     body: dict[str, Any] = {
         "accountId": account_id,
         "from": _ts(dt_from),
         "to": _ts(dt_to),
     }
     if state:
-        body["state"] = f"OPERATION_STATE_{state.upper()}"
+        body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     if figi:
         body["figi"] = figi
     data = await _call("OperationsService", "GetOperations", body)
@@ -340,7 +371,7 @@ async def get_operations_by_cursor(
     Args:
         account_id: Account ID
         from_date: Start date (YYYY-MM-DD), default: 1 year ago
-        to_date: End date (YYYY-MM-DD), default: now
+        to_date: End date (YYYY-MM-DD, inclusive), default: now
         cursor: Cursor from previous response for pagination
         limit: Number of operations per page (1-1000, default: 100)
         instrument_id: Filter by instrument FIGI or UID
@@ -351,7 +382,7 @@ async def get_operations_by_cursor(
     """
     now = datetime.now(timezone.utc)
     dt_from = _parse_date(from_date, now - timedelta(days=365))
-    dt_to = _parse_date(to_date, now)
+    dt_to = _parse_date(to_date, now, end_of_day=True)
     body: dict[str, Any] = {
         "accountId": account_id,
         "from": _ts(dt_from),
@@ -366,10 +397,10 @@ async def get_operations_by_cursor(
         body["instrumentId"] = instrument_id
     if operation_types:
         body["operationTypes"] = [
-            f"OPERATION_TYPE_{t.strip().upper()}" for t in operation_types.split(",")
+            _enum(t, "OPERATION_TYPE_") for t in operation_types.split(",") if t.strip()
         ]
     if state:
-        body["state"] = f"OPERATION_STATE_{state.upper()}"
+        body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
     return _fmt(data)
 
@@ -442,15 +473,19 @@ async def get_bond_coupons(
     """Get bond coupon payment schedule: dates, amounts, coupon periods.
 
     Args:
-        figi: Bond FIGI (deprecated, prefer instrument_id)
-        instrument_id: Bond FIGI or UID
+        figi: Deprecated, kept for existing callers — pass the FIGI as instrument_id instead
+        instrument_id: Bond FIGI or UID (required)
         from_date: Start date (YYYY-MM-DD), default: now
-        to_date: End date (YYYY-MM-DD), default: 1 year from now
+        to_date: End date (YYYY-MM-DD, inclusive), default: 1 year from now
     """
+    # Both have defaults only so that the old figi parameter keeps working. Left to the API,
+    # a call with neither fails with "Missing parameter: figi", which points at the wrong one.
+    if not (instrument_id or figi):
+        raise ValueError("instrument_id is required: the bond's FIGI or UID")
     now = datetime.now(timezone.utc)
     body: dict[str, Any] = {
         "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365))),
+        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     }
     if instrument_id:
         body["instrumentId"] = instrument_id
@@ -460,17 +495,39 @@ async def get_bond_coupons(
     return _fmt(data)
 
 
+BOND_EVENT_TYPES = ("CPN", "CALL", "MTY", "CONV")
+# Names this tool's description used to give. The API never knew them and ignored the filter.
+BOND_EVENT_ALIASES = {"COUPON": "CPN", "MATURITY": "MTY", "CONVERSION": "CONV"}
+
+
 @read_only_tool
-async def get_bond_events(instrument_id: str, type: str = "") -> str:
-    """Get bond events: coupon payments, amortizations, calls, puts, etc.
+async def get_bond_events(
+    instrument_id: str,
+    type: str = "",
+    from_date: str = "",
+    to_date: str = "",
+) -> str:
+    """Get bond events: coupon payments, offers (calls), maturity, conversions.
+
+    Without dates the API returns only a window of a few years around today, so a bond's
+    maturity or a distant offer needs an explicit from_date/to_date range to show up.
 
     Args:
         instrument_id: Bond FIGI or UID
-        type: Event type filter (empty = all). Values: COUPON, CALL, PUT, MATURITY, etc.
+        type: Event type filter (empty = all): CPN (coupon), CALL (offer), MTY (maturity),
+            CONV (conversion). The EVENT_TYPE_ prefix is optional; COUPON, MATURITY and
+            CONVERSION are accepted too.
+        from_date: Start date (YYYY-MM-DD), default: chosen by the API
+        to_date: End date (YYYY-MM-DD, inclusive), default: chosen by the API
     """
     body: dict[str, Any] = {"instrumentId": instrument_id}
     if type:
-        body["type"] = type
+        name = type.strip().upper()
+        body["type"] = _enum(BOND_EVENT_ALIASES.get(name, type), "EVENT_TYPE_", BOND_EVENT_TYPES)
+    if from_date:
+        body["from"] = _ts(_parse_date(from_date))
+    if to_date:
+        body["to"] = _ts(_parse_date(to_date, end_of_day=True))
     data = await _call("InstrumentsService", "GetBondEvents", body)
     return _fmt(data)
 
@@ -568,13 +625,13 @@ async def get_dividends(
     Args:
         instrument_id: Instrument FIGI or UID
         from_date: Start date (YYYY-MM-DD), default: 2 years ago
-        to_date: End date (YYYY-MM-DD), default: 1 year ahead
+        to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetDividends", {
         "instrumentId": instrument_id,
         "from": _ts(_parse_date(from_date, now - timedelta(days=730))),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365))),
+        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
     return _fmt(data)
 
@@ -590,13 +647,13 @@ async def get_accrued_interests(
     Args:
         instrument_id: Bond FIGI or UID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
-        to_date: End date (YYYY-MM-DD), default: now
+        to_date: End date (YYYY-MM-DD, inclusive), default: now
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAccruedInterests", {
         "instrumentId": instrument_id,
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
-        "to": _ts(_parse_date(to_date, now)),
+        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
     })
     return _fmt(data)
 
@@ -640,17 +697,24 @@ async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_p
     if not asset_uids:
         return {"error": "No asset UID to look a consensus forecast up by"}
     label = " / ".join(sorted(asset_uids))
-    for page_number in range(max_pages):
+    if page_limit < 1:
+        # What the API itself does with a non-positive limit; say so in the request, because
+        # clamping to 1 would turn the scan into a request per item.
+        page_limit = 100
+    seen = 0
+    for page_number in range(max(max_pages, 1)):
         data = await _call("InstrumentsService", "GetConsensusForecasts", {
             "paging": {"limit": page_limit, "pageNumber": page_number},
         })
-        for item in data.get("items", []):
+        items = data.get("items", [])
+        for item in items:
             # An item's own "uid" identifies the forecast record, not the instrument.
             if item.get("assetUid") in asset_uids:
                 return item
 
-        total_count = data.get("page", {}).get("totalCount", 0)
-        if (page_number + 1) * page_limit >= total_count:
+        # Counted from what actually came back, not from the page size that was asked for.
+        seen += len(items)
+        if not items or seen >= data.get("page", {}).get("totalCount", 0):
             return {"error": f"No consensus forecast found for asset {label}"}
 
     return {"error": (
@@ -675,8 +739,8 @@ async def get_consensus_forecasts(
 
     Args:
         instrument_id: Instrument UID or asset UID
-        page_limit: Page size used while scanning (default: 100)
-        max_pages: Safety cap on how many pages to scan before giving up (default: 50)
+        page_limit: Page size used while scanning (default: 100; a non-positive value means 100)
+        max_pages: Safety cap on how many pages to scan before giving up (default: 50, at least 1)
     """
     # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
     asset_uids = {instrument_id, await _asset_uid(instrument_id)} - {""}
@@ -705,8 +769,12 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     the manual ticker → UID → asset UID resolution) to get a compact picture of one share.
 
     Returns ticker, class_code, uid, asset_uid and name of the share it resolved to — check
-    them when the query is ambiguous — plus price {last_close, change_pct, change_sessions},
-    fundamentals and consensus. Returns {"error": ...} if no share matches.
+    them when the query is ambiguous — plus price, fundamentals and consensus. Returns
+    {"error": ...} if no share matches.
+
+    price holds last_close and last_close_date (the latest finished session), change_pct over
+    change_sessions finished sessions, and — only while today's session is still open —
+    current_price, which is not a close.
 
     Args:
         ticker: Ticker, name, ISIN, or FIGI of a share (searched with FindInstrument; an exact
@@ -739,7 +807,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
         fundamentals_for_asset(),
         _call("MarketDataService", "GetCandles", {
             "instrumentId": uid,
-            # Calendar window wide enough to hold candle_days + 1 sessions across
+            # Calendar window wide enough to hold candle_days + 1 finished sessions across
             # weekends and long holidays.
             "from": _ts(now - timedelta(days=candle_days * 3 // 2 + 14)),
             "to": _ts(now),
@@ -748,16 +816,25 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
         _consensus_forecast({asset_uid} - {""}),
     )
 
+    # Today's candle is unfinished while the session is open: its "close" is the price right
+    # now. Closes and the change are taken from finished sessions only.
+    all_candles = candles_data.get("candles", [])
+    finished = [c for c in all_candles if c.get("isComplete", True)]
+
     # The change is measured from the close before the first of the last candle_days sessions.
-    candles = candles_data.get("candles", [])[-(candle_days + 1):]
+    candles = finished[-(candle_days + 1):]
     price: dict[str, Any] = {}
     if candles:
         base_close = _quotation_to_float(candles[0].get("close"))
         last_close = _quotation_to_float(candles[-1].get("close"))
         price["last_close"] = last_close
+        if candles[-1].get("time"):
+            price["last_close_date"] = candles[-1]["time"][:10]
         if len(candles) > 1 and base_close and last_close is not None:
             price["change_pct"] = round((last_close - base_close) / base_close * 100, 2)
             price["change_sessions"] = len(candles) - 1
+    if all_candles and not all_candles[-1].get("isComplete", True):
+        price["current_price"] = _quotation_to_float(all_candles[-1].get("close"))
 
     return _fmt({
         "ticker": instrument.get("ticker"),
@@ -795,13 +872,13 @@ async def get_asset_reports(
     Args:
         instrument_id: Instrument UID
         from_date: Start date (YYYY-MM-DD), default: now
-        to_date: End date (YYYY-MM-DD), default: 1 year ahead
+        to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAssetReports", {
         "instrumentId": instrument_id,
         "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365))),
+        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
     return _fmt(data)
 
@@ -824,12 +901,12 @@ async def get_trading_schedules(
     Args:
         exchange: Exchange name (e.g. "MOEX", "SPB"). Empty = all exchanges.
         from_date: Start date (YYYY-MM-DD), default: today
-        to_date: End date (YYYY-MM-DD), default: 7 days ahead
+        to_date: End date (YYYY-MM-DD, inclusive), default: 7 days ahead
     """
     now = datetime.now(timezone.utc)
     body: dict[str, Any] = {
         "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=7))),
+        "to": _ts(_parse_date(to_date, now + timedelta(days=7), end_of_day=True)),
     }
     if exchange:
         body["exchange"] = exchange
@@ -852,7 +929,7 @@ async def get_candles(
     Args:
         instrument_id: Instrument FIGI or UID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
-        to_date: End date (YYYY-MM-DD), default: now
+        to_date: End date (YYYY-MM-DD, inclusive), default: now
         interval: Candle interval — CANDLE_INTERVAL_1_MIN, CANDLE_INTERVAL_5_MIN,
                   CANDLE_INTERVAL_15_MIN, CANDLE_INTERVAL_HOUR, CANDLE_INTERVAL_DAY,
                   CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH
@@ -861,7 +938,7 @@ async def get_candles(
     data = await _call("MarketDataService", "GetCandles", {
         "instrumentId": instrument_id,
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
-        "to": _ts(_parse_date(to_date, now)),
+        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
         "interval": interval,
     })
     return _fmt(data)
@@ -943,7 +1020,7 @@ async def get_tech_analysis(
         indicator_type: INDICATOR_TYPE_SMA, INDICATOR_TYPE_EMA, INDICATOR_TYPE_RSI,
                        INDICATOR_TYPE_MACD, INDICATOR_TYPE_BB
         from_date: Start date (YYYY-MM-DD), default: 90 days ago
-        to_date: End date (YYYY-MM-DD), default: now
+        to_date: End date (YYYY-MM-DD, inclusive), default: now
         interval: Not the get_candles names. INDICATOR_INTERVAL_ONE_MINUTE, INDICATOR_INTERVAL_2_MIN,
                   INDICATOR_INTERVAL_3_MIN, INDICATOR_INTERVAL_FIVE_MINUTES, INDICATOR_INTERVAL_10_MIN,
                   INDICATOR_INTERVAL_FIFTEEN_MINUTES, INDICATOR_INTERVAL_30_MIN, INDICATOR_INTERVAL_ONE_HOUR,
@@ -961,7 +1038,7 @@ async def get_tech_analysis(
         "instrumentUid": instrument_id,
         "indicatorType": indicator_type,
         "from": _ts(_parse_date(from_date, now - timedelta(days=90))),
-        "to": _ts(_parse_date(to_date, now)),
+        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
         "interval": interval,
         "typeOfPrice": type_of_price,
         "length": length,

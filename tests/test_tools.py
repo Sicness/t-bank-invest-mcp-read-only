@@ -106,12 +106,20 @@ class TestGetPortfolio:
         _, _, body = mock.call_args[0]
         assert body["currency"] == 1
 
-    async def test_unknown_currency_omits_key(self):
+    async def test_unknown_currency_is_rejected(self):
+        # Silently falling back to roubles would let the caller read rouble totals as GBP.
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_portfolio("acc1", "GBP")
+            with pytest.raises(ValueError, match="RUB, USD, EUR"):
+                await srv.get_portfolio("acc1", "GBP")
+        mock.assert_not_called()
+
+    async def test_currency_case_and_spaces(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_portfolio("acc1", " usd ")
         _, _, body = mock.call_args[0]
-        assert "currency" not in body
+        assert body["currency"] == 1
 
     async def test_account_id_in_body(self):
         mock = make_call_mock()
@@ -192,7 +200,35 @@ class TestGetOperations:
             await srv.get_operations("acc1", from_date="2024-01-01", to_date="2024-01-31")
         _, _, body = mock.call_args[0]
         assert body["from"] == "2024-01-01T00:00:00Z"
-        assert body["to"] == "2024-01-31T00:00:00Z"
+        assert body["to"] == "2024-01-31T23:59:59Z"
+
+    async def test_one_day_range_is_not_empty(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations("acc1", from_date="2024-01-31", to_date="2024-01-31")
+        _, _, body = mock.call_args[0]
+        assert (body["from"], body["to"]) == ("2024-01-31T00:00:00Z", "2024-01-31T23:59:59Z")
+
+    async def test_to_date_with_time_is_taken_as_is(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations("acc1", to_date="2024-01-31T10:00:00")
+        _, _, body = mock.call_args[0]
+        assert body["to"] == "2024-01-31T10:00:00Z"
+
+    async def test_state_already_prefixed(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations("acc1", state="OPERATION_STATE_EXECUTED")
+        _, _, body = mock.call_args[0]
+        assert body["state"] == "OPERATION_STATE_EXECUTED"
+
+    async def test_unknown_state_is_rejected(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="EXECUTED, CANCELED, PROGRESS"):
+                await srv.get_operations("acc1", state="DONE")
+        mock.assert_not_called()
 
 
 class TestGetOperationsByCursor:
@@ -262,6 +298,27 @@ class TestGetOperationsByCursor:
             await srv.get_operations_by_cursor("acc1", state="PROGRESS")
         _, _, body = mock.call_args[0]
         assert body["state"] == "OPERATION_STATE_PROGRESS"
+
+    async def test_state_already_prefixed(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations_by_cursor("acc1", state="operation_state_progress")
+        _, _, body = mock.call_args[0]
+        assert body["state"] == "OPERATION_STATE_PROGRESS"
+
+    async def test_operation_types_already_prefixed_and_empty_items(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations_by_cursor("acc1", operation_types="OPERATION_TYPE_BUY, sell,,")
+        _, _, body = mock.call_args[0]
+        assert body["operationTypes"] == ["OPERATION_TYPE_BUY", "OPERATION_TYPE_SELL"]
+
+    async def test_to_date_includes_the_whole_day(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations_by_cursor("acc1", from_date="2024-01-31", to_date="2024-01-31")
+        _, _, body = mock.call_args[0]
+        assert (body["from"], body["to"]) == ("2024-01-31T00:00:00Z", "2024-01-31T23:59:59Z")
 
     async def test_without_commissions(self):
         mock = make_call_mock()
@@ -348,11 +405,21 @@ class TestGetBondCoupons:
         assert body["instrumentId"] == "uid123"
 
     async def test_figi_in_body(self):
+        # Deprecated, but existing callers pass it and the API still takes it.
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
             await srv.get_bond_coupons(figi="BBG000BHR1G2")
         _, _, body = mock.call_args[0]
         assert body["figi"] == "BBG000BHR1G2"
+        assert "instrumentId" not in body
+
+    async def test_no_identifier_is_rejected_before_the_request(self):
+        # The API would answer "Missing parameter: figi", sending the caller to the deprecated one.
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="instrument_id is required"):
+                await srv.get_bond_coupons(from_date="2026-01-01")
+        mock.assert_not_called()
 
     async def test_dates_present(self):
         mock = make_call_mock()
@@ -368,7 +435,7 @@ class TestGetBondCoupons:
             await srv.get_bond_coupons(instrument_id="uid", from_date="2024-01-01", to_date="2024-12-31")
         _, _, body = mock.call_args[0]
         assert body["from"] == "2024-01-01T00:00:00Z"
-        assert body["to"] == "2024-12-31T00:00:00Z"
+        assert body["to"] == "2024-12-31T23:59:59Z"
 
 
 class TestGetBondEvents:
@@ -386,12 +453,51 @@ class TestGetBondEvents:
         _, _, body = mock.call_args[0]
         assert "type" not in body
 
-    async def test_type_included_when_set(self):
+    @pytest.mark.parametrize("given", ["CPN", "cpn", "EVENT_TYPE_CPN", " event_type_cpn "])
+    async def test_type_sent_as_full_enum_name(self, given):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_bond_events("uid123", type="COUPON")
+            await srv.get_bond_events("uid123", type=given)
         _, _, body = mock.call_args[0]
-        assert body["type"] == "COUPON"
+        assert body["type"] == "EVENT_TYPE_CPN"
+
+    @pytest.mark.parametrize("old_name, sent", [
+        ("COUPON", "EVENT_TYPE_CPN"), ("maturity", "EVENT_TYPE_MTY"), ("CONVERSION", "EVENT_TYPE_CONV"),
+    ])
+    async def test_names_from_the_old_description_now_filter(self, old_name, sent):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_events("uid123", type=old_name)
+        _, _, body = mock.call_args[0]
+        assert body["type"] == sent
+
+    @pytest.mark.parametrize("unknown", ["PUT", "AMORTIZATION", "EVENT_TYPE_BOGUS"])
+    async def test_unknown_type_is_rejected(self, unknown):
+        # The API ignores a type it does not know and returns every event, with no error.
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="CPN, CALL, MTY, CONV"):
+                await srv.get_bond_events("uid123", type=unknown)
+        mock.assert_not_called()
+
+    async def test_dates_omitted_by_default(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_events("uid123")
+        _, _, body = mock.call_args[0]
+        assert body == {"instrumentId": "uid123"}
+
+    async def test_explicit_dates(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_bond_events("uid123", type="MTY", from_date="2020-01-01", to_date="2045-01-01")
+        _, _, body = mock.call_args[0]
+        assert body == {
+            "instrumentId": "uid123",
+            "type": "EVENT_TYPE_MTY",
+            "from": "2020-01-01T00:00:00Z",
+            "to": "2045-01-01T23:59:59Z",
+        }
 
 
 class TestGetAssetFundamentals:
@@ -525,6 +631,32 @@ class TestGetConsensusForecasts:
         assert "max_pages" in result["error"]
         assert len(calls_to(mock, "GetConsensusForecasts")) == 3
 
+    async def test_non_positive_page_limit_does_not_scan_forever(self):
+        # The scan must stop once it has seen every item, not spend all max_pages requests
+        # because 0 * pages never reaches the total.
+        mock = make_paged_call_mock(
+            [([{"assetUid": "asset-other"}] * 100, 105), ([{"assetUid": "asset-other"}] * 5, 105)]
+            + [([], 105)] * 48
+        )
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("asset-target", page_limit=0))
+        assert "max_pages" not in result["error"]
+        assert len(calls_to(mock, "GetConsensusForecasts")) == 2
+        assert calls_to(mock, "GetConsensusForecasts")[0]["paging"]["limit"] == 100
+
+    async def test_stops_on_an_empty_page(self):
+        mock = make_paged_call_mock([([{"assetUid": "asset-other"}], 10), ([], 10)])
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("asset-target", page_limit=1))
+        assert "max_pages" not in result["error"]
+        assert len(calls_to(mock, "GetConsensusForecasts")) == 2
+
+    async def test_non_positive_max_pages_still_scans_one_page(self):
+        mock = make_paged_call_mock([([{"assetUid": "asset-target"}], 1)])
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("asset-target", max_pages=0))
+        assert result["assetUid"] == "asset-target"
+
     async def test_first_call_uses_given_page_limit(self):
         mock = make_paged_call_mock([([{"assetUid": "asset-target"}], 1)])
         with patch.object(srv, "_call", mock):
@@ -535,6 +667,15 @@ class TestGetConsensusForecasts:
 def closes(*values):
     """Daily candles, oldest first, with the given close prices."""
     return {"candles": [{"close": {"units": str(v), "nano": 0}} for v in values]}
+
+
+def candle(close, day, complete=True):
+    """A daily candle the way the API sends it: with its date and the isComplete flag."""
+    return {
+        "close": {"units": str(close), "nano": 0},
+        "time": f"{day}T00:00:00Z",
+        "isComplete": complete,
+    }
 
 
 def make_snapshot_call_mock(
@@ -686,6 +827,44 @@ class TestGetStockSnapshot:
             result = json.loads(await srv.get_stock_snapshot("SBER", candle_days=2))
         assert result["price"] == {"last_close": 120.0, "change_pct": 20.0, "change_sessions": 2}
 
+    async def test_unfinished_session_is_not_a_close(self):
+        # During trading hours the last daily candle is today's, still open: its "close" is
+        # the price right now and must not be reported as a close or counted as a session.
+        mock = make_snapshot_call_mock(candles={"candles": [
+            candle(80, "2026-09-28"),
+            candle(100, "2026-09-29"),
+            candle(110, "2026-09-30"),
+            candle(999, "2026-10-01", complete=False),
+        ]})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER", candle_days=1))
+        assert result["price"] == {
+            "last_close": 110.0,
+            "last_close_date": "2026-09-30",
+            "change_pct": 10.0,
+            "change_sessions": 1,
+            "current_price": 999.0,
+        }
+
+    async def test_no_current_price_when_last_session_is_finished(self):
+        mock = make_snapshot_call_mock(candles={"candles": [
+            candle(100, "2026-09-29"), candle(110, "2026-09-30"),
+        ]})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER", candle_days=1))
+        assert result["price"] == {
+            "last_close": 110.0,
+            "last_close_date": "2026-09-30",
+            "change_pct": 10.0,
+            "change_sessions": 1,
+        }
+
+    async def test_only_an_unfinished_candle(self):
+        mock = make_snapshot_call_mock(candles={"candles": [candle(105, "2026-10-01", complete=False)]})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER"))
+        assert result["price"] == {"current_price": 105.0}
+
     async def test_single_candle_reports_no_change(self):
         mock = make_snapshot_call_mock(candles=closes(100))
         with patch.object(srv, "_call", mock):
@@ -751,7 +930,7 @@ class TestGetAccruedInterests:
         _, _, body = mock.call_args[0]
         assert body["instrumentId"] == "uid123"
         assert body["from"] == "2024-01-01T00:00:00Z"
-        assert body["to"] == "2024-02-01T00:00:00Z"
+        assert body["to"] == "2024-02-01T23:59:59Z"
 
 
 class TestGetAssetReports:
@@ -762,7 +941,7 @@ class TestGetAssetReports:
         _, _, body = mock.call_args[0]
         assert body["instrumentId"] == "uid123"
         assert body["from"] == "2024-01-01T00:00:00Z"
-        assert body["to"] == "2024-12-31T00:00:00Z"
+        assert body["to"] == "2024-12-31T23:59:59Z"
 
 
 class TestGetFavorites:
@@ -861,8 +1040,18 @@ class TestGetCandles:
         _, _, body = mock.call_args[0]
         assert body["instrumentId"] == "uid123"
         assert body["from"] == "2024-01-01T00:00:00Z"
-        assert body["to"] == "2024-02-01T00:00:00Z"
+        assert body["to"] == "2024-02-01T23:59:59Z"
         assert body["interval"] == "CANDLE_INTERVAL_DAY"
+
+    async def test_one_day_of_intraday_candles(self):
+        # from == to used to send an empty range and get no candles back.
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_candles(
+                "uid123", from_date="2024-02-01", to_date="2024-02-01", interval="CANDLE_INTERVAL_HOUR"
+            )
+        _, _, body = mock.call_args[0]
+        assert (body["from"], body["to"]) == ("2024-02-01T00:00:00Z", "2024-02-01T23:59:59Z")
 
     async def test_custom_interval(self):
         mock = make_call_mock()

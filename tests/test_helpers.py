@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from tbank_invest_mcp.server import (
+    _enum,
     _fmt,
     _get_token,
     _headers,
@@ -103,6 +104,37 @@ class TestParseDate:
     def test_invalid_raises(self, bad):
         with pytest.raises(ValueError, match="Cannot parse date"):
             _parse_date(bad)
+
+    def test_surrounding_spaces_ignored(self):
+        assert _parse_date(" 2024-01-15 ") == datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+    def test_end_of_day_for_a_bare_date(self):
+        result = _parse_date("2024-01-15", end_of_day=True)
+        assert result == datetime(2024, 1, 15, 23, 59, 59, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("s", ["2024-01-15T10:30:00", "2024-01-15T10:30:00Z", "2024-01-15T00:00:00"])
+    def test_end_of_day_leaves_an_explicit_time_alone(self, s):
+        assert _parse_date(s, end_of_day=True) == _parse_date(s)
+
+    def test_end_of_day_does_not_touch_the_default(self):
+        default = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+        assert _parse_date("", default, end_of_day=True) is default
+
+
+class TestEnum:
+    @pytest.mark.parametrize("given", ["EXECUTED", "executed", " Executed ", "OPERATION_STATE_EXECUTED"])
+    def test_prefix_added_once(self, given):
+        assert _enum(given, "OPERATION_STATE_") == "OPERATION_STATE_EXECUTED"
+
+    def test_allowed_values_pass(self):
+        assert _enum("mty", "EVENT_TYPE_", ("CPN", "MTY")) == "EVENT_TYPE_MTY"
+
+    def test_unknown_value_names_the_valid_ones(self):
+        with pytest.raises(ValueError, match="'MATURITY'.*CPN, MTY"):
+            _enum("MATURITY", "EVENT_TYPE_", ("CPN", "MTY"))
+
+    def test_no_allowed_list_means_no_check(self):
+        assert _enum("anything", "OPERATION_TYPE_") == "OPERATION_TYPE_ANYTHING"
 
 
 class TestFmt:
