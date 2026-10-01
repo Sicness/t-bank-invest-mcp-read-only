@@ -163,3 +163,48 @@ class TestCallErrorMessage:
     async def test_response_stays_available(self):
         error = await self._error(httpx.Response(404, json={"message": "Instrument not found"}))
         assert error.response.status_code == 404
+
+
+class TestCallTransportErrors:
+    """Failures with no HTTP status at all: the model still has to be told what happened."""
+
+    @staticmethod
+    async def _error(exc: Exception, expected: type[Exception]) -> Exception:
+        client = AsyncMock()
+        client.post.side_effect = exc
+        with patch("httpx.AsyncClient", return_value=client):
+            with pytest.raises(expected) as exc_info:
+                await _call("MarketDataService", "GetTradingStatus", {})
+        return exc_info.value
+
+    async def test_timeout_is_not_an_empty_message(self):
+        # httpx raises timeouts with an empty message; FastMCP would report "Error executing tool x: ".
+        error = await self._error(httpx.ReadTimeout(""), httpx.ReadTimeout)
+        assert str(error) == (
+            "T-Bank API request MarketDataService/GetTradingStatus failed (ReadTimeout): "
+            "no answer within 30 seconds; the request can be retried"
+        )
+
+    async def test_connect_timeout_keeps_its_type(self):
+        error = await self._error(httpx.ConnectTimeout(""), httpx.ConnectTimeout)
+        assert "ConnectTimeout" in str(error)
+        assert isinstance(error, httpx.TimeoutException)
+
+    async def test_network_error_keeps_its_details(self):
+        error = await self._error(httpx.ConnectError("Name or service not known"), httpx.ConnectError)
+        assert str(error) == (
+            "T-Bank API request MarketDataService/GetTradingStatus failed (ConnectError): "
+            "Name or service not known"
+        )
+
+    async def test_token_never_reaches_the_message(self):
+        # h11 quotes the whole header when it refuses one; whatever an error quotes, not the token.
+        error = await self._error(
+            httpx.LocalProtocolError("Illegal header value b'Bearer test-token'"), httpx.LocalProtocolError
+        )
+        assert "test-token" not in str(error)
+        assert "Bearer <token>" in str(error)
+
+    async def test_error_without_details(self):
+        error = await self._error(httpx.ReadError(""), httpx.ReadError)
+        assert str(error).endswith("failed (ReadError): no details")

@@ -29,6 +29,8 @@ SERVICE_PREFIX = "tinkoff.public.invest.api.contract.v1"
 CA_FILE = Path(__file__).parent / "certs" / "russian_trusted_root_ca.pem"
 CA_SHA256 = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
 
+TIMEOUT_SECONDS = 30
+
 mcp = FastMCP(
     "t-bank-invest-mcp-read-only",
     instructions=(
@@ -60,11 +62,19 @@ def read_only_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def _get_token() -> str:
-    token = os.environ.get("TBANK_INVEST_TOKEN", "")
+    # Stripped: a trailing newline from a copy-paste or `$(cat file)` is not part of the token.
+    token = os.environ.get("TBANK_INVEST_TOKEN", "").strip()
     if not token:
         raise ValueError(
             "TBANK_INVEST_TOKEN environment variable is not set. "
             "Get your token at https://www.tbank.ru/invest/settings/api/"
+        )
+    # Checked here, and without echoing the value: httpx would refuse such a header with an
+    # error that quotes it in full, and that error text goes to the model.
+    if not token.isascii() or not token.isprintable() or " " in token:
+        raise ValueError(
+            "TBANK_INVEST_TOKEN contains characters a token cannot have (spaces, line breaks "
+            "or non-ASCII characters). Copy the token again without anything around it."
         )
     return token
 
@@ -105,7 +115,7 @@ _client: httpx.AsyncClient | None = None
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=30, verify=_ssl_context())
+        _client = httpx.AsyncClient(timeout=TIMEOUT_SECONDS, verify=_ssl_context())
     return _client
 
 
@@ -124,9 +134,24 @@ def _api_error(service: str, method: str, resp: httpx.Response) -> str:
     return f"T-Bank API returned HTTP {resp.status_code} for {service}/{method}: {detail}"
 
 
+def _transport_error(service: str, method: str, exc: httpx.RequestError, token: str) -> str:
+    """What went wrong before any HTTP status arrived: a timeout or a network failure."""
+    if isinstance(exc, httpx.TimeoutException):
+        # httpx gives timeouts an empty message.
+        detail = f"no answer within {TIMEOUT_SECONDS} seconds; the request can be retried"
+    else:
+        # Never let the token through, whatever the underlying error chose to quote.
+        detail = str(exc).replace(token, "<token>") or "no details"
+    return f"T-Bank API request {service}/{method} failed ({type(exc).__name__}): {detail}"
+
+
 async def _call(service: str, method: str, body: dict[str, Any] | None = None) -> dict:
     url = f"{BASE_URL}/{SERVICE_PREFIX}.{service}/{method}"
-    resp = await _get_client().post(url, headers=_headers(), json=body or {})
+    headers = _headers()
+    try:
+        resp = await _get_client().post(url, headers=headers, json=body or {})
+    except httpx.RequestError as e:
+        raise type(e)(_transport_error(service, method, e, _get_token())) from None
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:

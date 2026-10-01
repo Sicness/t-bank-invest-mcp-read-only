@@ -31,6 +31,24 @@ class TestGetToken:
         monkeypatch.setenv("TBANK_INVEST_TOKEN", "mytoken123")
         assert _get_token() == "mytoken123"
 
+    @pytest.mark.parametrize("raw", ["mytoken123\n", "  mytoken123", "\tmytoken123\r\n"])
+    def test_surrounding_whitespace_is_stripped(self, monkeypatch, raw):
+        monkeypatch.setenv("TBANK_INVEST_TOKEN", raw)
+        assert _get_token() == "mytoken123"
+
+    def test_whitespace_only_counts_as_missing(self, monkeypatch):
+        monkeypatch.setenv("TBANK_INVEST_TOKEN", " \n")
+        with pytest.raises(ValueError, match="is not set"):
+            _get_token()
+
+    @pytest.mark.parametrize("bad", ["my token", "my\ntoken", "токен123", "tok\x7fen"])
+    def test_malformed_token_is_rejected_without_echoing_it(self, monkeypatch, bad):
+        monkeypatch.setenv("TBANK_INVEST_TOKEN", bad)
+        with pytest.raises(ValueError) as exc_info:
+            _get_token()
+        assert "characters a token cannot have" in str(exc_info.value)
+        assert bad not in str(exc_info.value)
+
 
 class TestHeaders:
     @pytest.fixture(autouse=True)
