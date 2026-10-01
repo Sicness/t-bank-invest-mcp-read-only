@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -111,6 +112,13 @@ def _parse_date(s: str | None, default: datetime | None = None) -> datetime | No
 
 def _fmt(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
+    """Convert a Quotation/MoneyValue object ({units, nano}) to a plain float."""
+    if not q:
+        return None
+    return float(q.get("units", 0)) + float(q.get("nano", 0)) / 1_000_000_000
 
 
 # ── Account & User ──────────────────────────────────────────────────────────
@@ -529,24 +537,162 @@ async def get_asset_fundamentals(assets: str) -> str:
     return _fmt(data)
 
 
+async def _asset_uid(instrument_uid: str) -> str:
+    """Asset UID of an instrument, or "" if instrument_uid is not a known instrument UID.
+
+    Fundamentals and consensus forecasts are keyed by asset UID, which is a different
+    identifier from the instrument UID that FindInstrument and the *By lookups return.
+    """
+    try:
+        data = await _call("InstrumentsService", "GetInstrumentBy", {
+            "idType": "INSTRUMENT_ID_TYPE_UID",
+            "id": instrument_uid,
+        })
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return ""
+        raise
+    return data.get("instrument", {}).get("assetUid", "")
+
+
+async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
+    """Scan GetConsensusForecasts pages for the item whose assetUid is in asset_uids.
+
+    Returns the item, or {"error": ...} saying whether the whole list was scanned or the
+    scan was cut short by max_pages.
+    """
+    if not asset_uids:
+        return {"error": "No asset UID to look a consensus forecast up by"}
+    label = " / ".join(sorted(asset_uids))
+    for page_number in range(max_pages):
+        data = await _call("InstrumentsService", "GetConsensusForecasts", {
+            "paging": {"limit": page_limit, "pageNumber": page_number},
+        })
+        for item in data.get("items", []):
+            # An item's own "uid" identifies the forecast record, not the instrument.
+            if item.get("assetUid") in asset_uids:
+                return item
+
+        total_count = data.get("page", {}).get("totalCount", 0)
+        if (page_number + 1) * page_limit >= total_count:
+            return {"error": f"No consensus forecast found for asset {label}"}
+
+    return {"error": (
+        f"No consensus forecast found for asset {label} in the first {max_pages} pages; "
+        "the scan stopped at max_pages before reaching the end of the list — raise max_pages"
+    )}
+
+
 @mcp.tool()
 async def get_consensus_forecasts(
     instrument_id: str,
     page_limit: int = 100,
-    page_number: int = 0,
+    max_pages: int = 50,
 ) -> str:
-    """Get analyst consensus forecasts for an instrument: target price, recommendation, number of analysts.
+    """Get the analyst consensus forecast for one instrument: target price, recommendation,
+    number of analysts.
+
+    GetConsensusForecasts has no server-side instrument filter — it only returns pages of
+    forecasts for the whole instrument universe, keyed by asset UID. This resolves
+    instrument_id to its asset UID, scans pages internally and returns just the matching
+    item, or {"error": ...} if there is none.
 
     Args:
-        instrument_id: Instrument UID
-        page_limit: Results per page (default: 100)
-        page_number: Page number starting from 0
+        instrument_id: Instrument UID or asset UID
+        page_limit: Page size used while scanning (default: 100)
+        max_pages: Safety cap on how many pages to scan before giving up (default: 50)
     """
-    data = await _call("InstrumentsService", "GetConsensusForecasts", {
-        "paging": {"limit": page_limit, "pageNumber": page_number},
+    # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
+    asset_uids = {instrument_id, await _asset_uid(instrument_id)} - {""}
+    return _fmt(await _consensus_forecast(asset_uids, page_limit, max_pages))
+
+
+def _pick_instrument(instruments: list[dict], query: str, class_code: str = "") -> dict | None:
+    """Choose one FindInstrument hit: an exact ticker/ISIN/FIGI match beats search order."""
+    if class_code:
+        instruments = [i for i in instruments if i.get("classCode") == class_code]
+    q = query.strip().upper()
+    exact = [
+        i for i in instruments
+        if q in (i.get("ticker", "").upper(), i.get("isin", "").upper(), i.get("figi", "").upper())
+    ]
+    candidates = exact or instruments
+    return next((i for i in candidates if i.get("apiTradeAvailableFlag")), next(iter(candidates), None))
+
+
+@mcp.tool()
+async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str = "") -> str:
+    """Get a one-call overview of a share: fundamentals, recent price change, and analyst consensus.
+
+    Convenience wrapper around FindInstrument + GetInstrumentBy + GetAssetFundamentals +
+    GetCandles + GetConsensusForecasts, so a caller doesn't need separate round trips (and
+    the manual ticker → UID → asset UID resolution) to get a compact picture of one share.
+
+    Returns ticker, class_code, uid, asset_uid and name of the share it resolved to — check
+    them when the query is ambiguous — plus price {last_close, change_pct, change_sessions},
+    fundamentals and consensus. Returns {"error": ...} if no share matches.
+
+    Args:
+        ticker: Ticker, name, ISIN, or FIGI of a share (searched with FindInstrument; an exact
+            ticker/ISIN/FIGI match is preferred over the first search hit)
+        candle_days: Number of daily candles (trading sessions) the price change spans (default: 5)
+        class_code: Optional class code to disambiguate listings (e.g. "TQBR")
+    """
+    if candle_days < 1:
+        raise ValueError(f"candle_days must be at least 1, got {candle_days}")
+
+    found = await _call("InstrumentsService", "FindInstrument", {
+        "query": ticker,
+        "instrumentKind": "INSTRUMENT_TYPE_SHARE",
     })
-    # Filter for the requested instrument if needed
-    return _fmt(data)
+    instrument = _pick_instrument(found.get("instruments", []), ticker, class_code)
+    if instrument is None:
+        return _fmt({"error": f"No share found for ticker={ticker!r}, class_code={class_code!r}"})
+    uid = instrument.get("uid", "")
+
+    asset_uid = await _asset_uid(uid)
+
+    async def fundamentals_for_asset() -> dict:
+        if not asset_uid:
+            return {}
+        data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": [asset_uid]})
+        return next(iter(data.get("fundamentals", [])), {})
+
+    now = datetime.now(timezone.utc)
+    fundamentals, candles_data, consensus = await asyncio.gather(
+        fundamentals_for_asset(),
+        _call("MarketDataService", "GetCandles", {
+            "instrumentId": uid,
+            # Calendar window wide enough to hold candle_days + 1 sessions across
+            # weekends and long holidays.
+            "from": _ts(now - timedelta(days=candle_days * 3 // 2 + 14)),
+            "to": _ts(now),
+            "interval": "CANDLE_INTERVAL_DAY",
+        }),
+        _consensus_forecast({asset_uid} - {""}),
+    )
+
+    # The change is measured from the close before the first of the last candle_days sessions.
+    candles = candles_data.get("candles", [])[-(candle_days + 1):]
+    price: dict[str, Any] = {}
+    if candles:
+        base_close = _quotation_to_float(candles[0].get("close"))
+        last_close = _quotation_to_float(candles[-1].get("close"))
+        price["last_close"] = last_close
+        if len(candles) > 1 and base_close and last_close is not None:
+            price["change_pct"] = round((last_close - base_close) / base_close * 100, 2)
+            price["change_sessions"] = len(candles) - 1
+
+    return _fmt({
+        "ticker": instrument.get("ticker"),
+        "class_code": instrument.get("classCode"),
+        "uid": uid,
+        "asset_uid": asset_uid,
+        "name": instrument.get("name"),
+        "price": price,
+        "fundamentals": fundamentals,
+        "consensus": consensus,
+    })
 
 
 @mcp.tool()
