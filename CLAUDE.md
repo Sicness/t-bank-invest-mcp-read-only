@@ -43,8 +43,10 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 | `_transport_error(service, method, exc, token)` | the same for failures with no HTTP status; httpx timeouts have an empty message, and the token is masked in whatever the error quotes |
 | `_ts(dt)` / `_parse_date(s, default, end_of_day=False)` | UTC datetime ↔ RFC 3339; accepts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, with or without `Z`; `end_of_day=True` turns a bare date into 23:59:59 of that day |
 | `_enum(value, prefix, allowed=())` | full enum name from a value given with or without its prefix, in any case; with `allowed`, rejects an unknown value |
-| `_fmt(data)` | compact `json.dumps(..., ensure_ascii=False)` — what every tool returns |
-| `_quotation_to_float(q)` / `_to_quotation(value)` | `{units, nano}` → float (`None` for a missing value), and a number → `{units, nano}` for a request body |
+| `_plain(data)` | the response with every `{units, nano}` made a number and currencies folded into one `currency` field per object |
+| `_trimmed(data, *list_keys, drop=())` | `_plain` plus zero, false and empty fields removed from the items of the named lists |
+| `_fmt(data)` | compact `json.dumps(_plain(data), ensure_ascii=False)` — what every tool returns |
+| `_number(q)` / `_quotation_to_float(q)` / `_to_quotation(value)` | `{units, nano}` → int or float; → float or `None` for a missing value; and a number → `{units, nano}` for a request body |
 | `_asset_uid(instrument_uid)` | instrument UID → asset UID via `GetInstrumentBy`; `""` on 404 |
 | `_consensus_forecast(asset_uids, ...)` | pages through `GetConsensusForecasts` to find one asset's item |
 | `_pick_instrument(instruments, query, class_code)` | chooses one `FindInstrument` hit |
@@ -55,7 +57,8 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 
 - **The docstring is the tool's public contract.** FastMCP sends it, with the `Args:` section, to the MCP client as the tool description, and the model on the other side decides how to call the tool from that text alone. Keep parameters, defaults and the return shape described there in step with the code.
 - **Every tool is registered with `@read_only_tool`, never with `mcp.tool()` directly.** It marks the tool `readOnlyHint` for the client — which is what lets a client skip confirmation prompts — and turns off FastMCP's structured output: tools return a JSON string, and FastMCP would otherwise send that string a second time wrapped in `structuredContent`. `tests/test_server.py` fails if a tool bypasses it.
-- **Most tools are thin pass-throughs**: build the body, `_call`, `return _fmt(data)` — the raw API response with its camelCase keys. Only composite tools shape their own output (`get_stock_snapshot`, `get_consensus_forecasts`); those use snake_case keys for what they add.
+- **Most tools are thin**: build the body, `_call`, `return _fmt(data)` — the API response with its camelCase keys, but never raw: `_fmt` runs everything through `_plain`, so amounts are numbers everywhere. Tools returning long lists of wide objects also trim them with `_trimmed` (`get_portfolio`, `get_positions`, both operations tools, `get_bond_events`), and `get_candles` returns rows. Composite tools shape their own output (`get_stock_snapshot`, `get_consensus_forecasts`) and use snake_case keys for what they add.
+- **A response has to fit in a model's context.** Claude Code refuses a tool result above roughly 25,000 tokens — with real data that was every `get_portfolio` call. Before adding a tool or a field, look at the size of a real response, not a mocked one.
 - **Parameters are flat strings, ints and bools.** Lists arrive as comma-separated strings and are split and stripped in the tool (`assets`, `instrument_ids`, `operation_types`). Optional parameters default to `""` and are left out of the body when empty.
 - **Dates** come in as strings through `_parse_date`, each tool supplying its own default window (documented in its docstring) relative to `datetime.now(timezone.utc)`. They are UTC. Every `to_date` is parsed with `end_of_day=True`, so a range given in whole days includes its last day and `from_date == to_date` means that one day, not an empty range.
 - **Enums** go to the API as full prefixed strings (`CANDLE_INTERVAL_DAY`, `INSTRUMENT_ID_TYPE_UID`, `INDICATOR_TYPE_RSI`) and most tools expect the caller to pass them that way. The filters that take short names go through `_enum`, which accepts the value with or without its prefix: `state` (`EXECUTED` → `OPERATION_STATE_EXECUTED`), `operation_types` (`BUY` → `OPERATION_TYPE_BUY`) and the bond event `type` (`CPN` → `EVENT_TYPE_CPN`). Where the enum is small, pass `allowed` so that an unknown value is an error here — the API would silently ignore it and return unfiltered data. `get_portfolio` sends currency as an integer (RUB 0, USD 1, EUR 2) and rejects anything else for the same reason.
@@ -82,7 +85,7 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 - `tests/test_tools.py` — every tool. `_call` is replaced with an `AsyncMock` (`patch.object(srv, "_call", mock)`), then the test asserts on `mock.call_args[0]` → `(service, method, body)` and on the returned JSON. Tools that make several calls use a router mock keyed by method name (`make_paged_call_mock`, `make_snapshot_call_mock`).
 - `tests/test_call.py` — `_call` itself against a mocked `AsyncClient`: URL, headers, body, error propagation and the error text, for HTTP statuses (those tests use real `httpx.Response` objects) and for timeouts and network failures. It resets `server._client` around each test because the client is module-level.
 - `tests/test_ssl.py` — the pinned CA, the fingerprint guard, the `TBANK_CA_BUNDLE` override.
-- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_enum`, `_fmt`, `_to_quotation`.
+- `tests/test_helpers.py` — `_get_token`, `_headers`, `_ts`, `_parse_date`, `_enum`, `_fmt`, `_to_quotation`, `_plain`, `_trimmed`.
 - `tests/test_server.py` — what an MCP client receives, through `mcp.list_tools()` and `mcp.call_tool()`: every tool registered and marked read-only, descriptions, the reported server version, the shape of a result and of an error.
 
 `asyncio_mode = "auto"`, so async tests need no marker.
@@ -95,7 +98,7 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 2. Check the method's request and response fields in the proto contract rather than guessing names.
 3. Add a test class to `tests/test_tools.py` covering the request body, defaults and any shaping of the result.
 4. Update the tool table in `README.md` (Russian), and the helper table here if a helper was added.
-5. Renaming a tool, renaming or removing a parameter, or changing an output shape breaks existing clients. Don't: extend instead — a new optional parameter whose default keeps the old behaviour, or a new tool next to the old one.
+5. Don't rename or remove a tool or a parameter. A model reads the tool list afresh every session and adapts, but people don't: client permission lists (`mcp__t-bank-invest__get_portfolio`), skills and prompts name tools and parameters literally. Extend instead — a new optional parameter, or a new tool next to the old one. An output's shape is cheaper to change (only scripts that parse it notice) and may change until 1.0.0; after that, keep existing fields and only add.
 
 ## Releasing
 
@@ -103,7 +106,7 @@ Users install with `uvx` straight from this repository (see `README.md`), so the
 
 To release: set `version` in `pyproject.toml` to the release number, commit, push `main`, then tag that commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` refuses a tag that is not on `main` or that differs from the version, builds sdist and wheel, runs the test suite against the installed wheel, publishes to PyPI through Trusted Publishing (the `pypi` environment; no API token is stored) and creates a GitHub Release with generated notes — marked as a pre-release when the version is a dev, alpha, beta or rc one.
 
-The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0`. Semantic versioning applies to the tool contract: minor for new tools and parameters, patch for fixes. A major bump would mean a renamed or removed tool or parameter or a changed output shape, and that is not planned — people already run this server from `main`.
+The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0`. Semantic versioning applies to the tool contract: minor for new tools and parameters, patch for fixes. A major bump would mean a renamed or removed tool or parameter, or — from 1.0.0 on — a removed or redefined output field, and that is not planned: people already run this server from `main`.
 
 ## Dependencies
 

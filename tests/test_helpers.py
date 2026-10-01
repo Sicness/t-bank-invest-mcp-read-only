@@ -7,6 +7,8 @@ import pytest
 
 from tbank_invest_mcp.server import (
     _enum,
+    _plain,
+    _trimmed,
     _fmt,
     _get_token,
     _headers,
@@ -171,3 +173,92 @@ class TestToQuotation:
     @pytest.mark.parametrize("value", [2.0, 2.5, 0.05, 312.45, -1.5])
     def test_round_trip(self, value):
         assert _quotation_to_float(_to_quotation(value)) == pytest.approx(value)
+
+
+def q(units, nano=0):
+    return {"units": str(units), "nano": nano}
+
+
+def m(units, nano=0, currency="rub"):
+    return {"currency": currency, "units": str(units), "nano": nano}
+
+
+class TestPlain:
+    @pytest.mark.parametrize("value, expected", [
+        (q(273, 800000000), 273.8),
+        (q(100), 100),
+        (q(0), 0),
+        (q(-1, -500000000), -1.5),
+        (q(0, 10000000), 0.01),
+        ({"units": "5"}, 5),
+        ({"nano": 250000000}, 0.25),
+    ])
+    def test_quotation_becomes_a_number(self, value, expected):
+        result = _plain({"price": value})["price"]
+        assert result == expected
+        assert type(result) is type(expected)
+
+    def test_amounts_share_the_objects_currency(self):
+        assert _plain({"price": m(274, 100000000), "payment": m(-27410)}) == {
+            "currency": "rub", "price": 274.1, "payment": -27410,
+        }
+
+    def test_existing_currency_field_is_kept_when_it_agrees(self):
+        assert _plain({"currency": "RUB", "nominal": m(1000)}) == {"currency": "RUB", "nominal": 1000}
+
+    def test_amounts_in_different_currencies_stay_explicit(self):
+        assert _plain({"nominal": m(1000, currency="usd"), "aciValue": m(12, 300000000)}) == {
+            "nominal": {"value": 1000, "currency": "usd"},
+            "aciValue": {"value": 12.3, "currency": "rub"},
+        }
+
+    def test_amount_that_disagrees_with_the_objects_currency_stays_explicit(self):
+        assert _plain({"currency": "rub", "nominal": m(1000, currency="usd")}) == {
+            "currency": "rub", "nominal": {"value": 1000, "currency": "usd"},
+        }
+
+    def test_amount_without_a_currency_does_not_decide_it(self):
+        assert _plain({"price": m(10), "varMargin": m(0, currency="")}) == {
+            "currency": "rub", "price": 10, "varMargin": 0,
+        }
+
+    def test_amount_on_its_own(self):
+        assert _plain([m(1500, 500000000), m(20, currency="usd")]) == [
+            {"value": 1500.5, "currency": "rub"}, {"value": 20, "currency": "usd"},
+        ]
+
+    def test_nested_structures(self):
+        data = {"bids": [{"price": q(274, 100000000), "quantity": "10"}], "depth": 1, "name": "x"}
+        assert _plain(data) == {"bids": [{"price": 274.1, "quantity": "10"}], "depth": 1, "name": "x"}
+
+    def test_other_objects_are_left_alone(self):
+        data = {"units": "5", "nano": 0, "figi": "F"}  # not a Quotation: it has another field
+        assert _plain(data) == data
+        assert _plain({}) == {}
+        assert _plain({"brand": {}}) == {"brand": {}}
+
+    def test_applying_twice_changes_nothing(self):
+        data = {"price": m(274, 100000000), "items": [m(1), {"nominal": m(5, currency="usd"), "x": m(1)}]}
+        once = _plain(data)
+        assert _plain(once) == once
+
+    def test_fmt_applies_it(self):
+        assert _fmt({"price": q(1, 500000000)}) == '{"price":1.5}'
+
+
+class TestTrimmed:
+    def test_drops_zero_false_and_empty_fields_of_list_items(self):
+        data = {"positions": [{"ticker": "SBER", "blocked": False, "blockedLots": q(0), "note": "",
+                               "balance": "0", "trades": [], "extra": {}, "quantity": q(10), "flag": True}]}
+        assert _trimmed(data, "positions") == {"positions": [{"ticker": "SBER", "quantity": 10, "flag": True}]}
+
+    def test_named_fields_are_dropped_whatever_they_hold(self):
+        data = {"positions": [{"ticker": "SBER", "quantityLots": q(10)}]}
+        assert _trimmed(data, "positions", drop=("quantityLots",)) == {"positions": [{"ticker": "SBER"}]}
+
+    def test_only_the_named_lists_are_trimmed(self):
+        data = {"total": q(0), "hasNext": False, "other": [{"x": 0}], "positions": [{"x": 0, "y": 1}]}
+        assert _trimmed(data, "positions") == {"total": 0, "hasNext": False, "other": [{"x": 0}], "positions": [{"y": 1}]}
+
+    def test_missing_list_is_fine(self):
+        assert _trimmed({"a": 1}, "positions") == {"a": 1}

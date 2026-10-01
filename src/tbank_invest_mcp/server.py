@@ -36,10 +36,11 @@ mcp = FastMCP(
     instructions=(
         "MCP server for reading T-Bank (Tinkoff) investment portfolio data. "
         "Provides read-only access to accounts, portfolios, positions, operations, "
-        "instruments, market data, and orders. All monetary values use MoneyValue format: "
-        "units (integer part) + nano (fractional part, 10^-9). "
-        "To convert: value = units + nano / 1_000_000_000. "
-        "Quotation format is the same but without currency. "
+        "instruments, market data, and orders. "
+        "Prices and amounts are plain numbers. An amount's currency is the `currency` field "
+        "of the object it is in; an amount in some other currency is written as "
+        "{value, currency}. Lists of positions, operations and bond events leave out fields "
+        "that are zero, false or empty. "
         "Dates are UTC. A from_date/to_date given as YYYY-MM-DD covers whole days: "
         "to_date includes that day up to 23:59:59."
     ),
@@ -207,9 +208,84 @@ def _enum(value: str, prefix: str, allowed: tuple[str, ...] = ()) -> str:
     return prefix + name
 
 
+def _number(q: dict[str, Any]) -> int | float:
+    """A Quotation or MoneyValue ({units, nano}) as a number; an int when it is whole."""
+    units, nano = int(q.get("units", 0)), int(q.get("nano", 0))
+    return units if nano == 0 else round(units + nano / 1_000_000_000, 9)
+
+
+def _is_quotation(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value) and value.keys() <= {"units", "nano"}
+
+
+def _is_money(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("currency"), str)
+        and ("units" in value or "nano" in value)
+        and value.keys() <= {"currency", "units", "nano"}
+    )
+
+
+def _plain(data: Any) -> Any:
+    """An API response with every {units, nano} pair turned into a plain number.
+
+    A Quotation becomes a number. So does a MoneyValue, and its currency is named once, in
+    the `currency` field of the object holding it — the field the API often has there
+    anyway. When the amounts of one object are in different currencies, or the object's own
+    `currency` says something else, each amount stays explicit as {value, currency}.
+    """
+    if isinstance(data, list):
+        return [_plain(item) for item in data]
+    if not isinstance(data, dict):
+        return data
+    if _is_quotation(data):
+        return _number(data)
+    if _is_money(data):  # an amount on its own, e.g. an item of a list of balances
+        return {"value": _number(data), "currency": data["currency"]} if data["currency"] else _number(data)
+
+    currencies = {v["currency"].lower() for v in data.values() if _is_money(v) and v["currency"]}
+    shared = next(iter(currencies)) if len(currencies) == 1 else None
+    own = data.get("currency")
+    if shared and own is not None and (not isinstance(own, str) or own.lower() != shared):
+        shared = None
+
+    out: dict[str, Any] = {}
+    if shared and own is None:
+        out["currency"] = shared
+    for key, value in data.items():
+        if _is_money(value) and (shared or not value["currency"]):
+            out[key] = _number(value)
+        else:
+            out[key] = _plain(value)
+    return out
+
+
+def _is_empty(value: Any) -> bool:
+    return value is None or value is False or value in (0, "0", "") or value == [] or value == {}
+
+
+def _trimmed(data: dict, *list_keys: str, drop: tuple[str, ...] = ()) -> dict:
+    """_plain(data) whose items in the named lists have lost their zero, false and empty fields.
+
+    Positions, operations and bond events are long lists of wide objects in which most
+    fields say "nothing here"; leaving those out is what makes such a response fit into a
+    model's context. drop names fields to leave out whatever they hold.
+    """
+    out = _plain(data)
+    for key in list_keys:
+        if isinstance(out.get(key), list):
+            out[key] = [
+                {k: v for k, v in item.items() if k not in drop and not _is_empty(v)}
+                if isinstance(item, dict) else item
+                for item in out[key]
+            ]
+    return out
+
+
 def _fmt(data: Any) -> str:
     # Compact: the reader is a model, and indentation is a third or more of a response.
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(_plain(data), ensure_ascii=False, separators=(",", ":"))
 
 
 def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
@@ -264,8 +340,9 @@ async def get_margin_attributes(account_id: str) -> str:
 async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
     """Get full portfolio for an account: total values by asset type, all positions with prices, yields, and quantities.
 
-    Each position includes: figi, instrument_type, quantity, average_position_price,
-    expected_yield, current_price, daily_yield, ticker, class_code.
+    Each position has ticker, classCode, figi, instrumentUid, instrumentType, quantity,
+    averagePositionPrice, currentPrice, expectedYield, dailyYield, currentNkd (bonds) and its
+    `currency`. Amounts are plain numbers; a field that is zero or false is left out.
 
     Args:
         account_id: Account ID (get from get_accounts)
@@ -277,7 +354,10 @@ async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
         raise ValueError(f"currency must be one of {', '.join(currency_map)}, got {currency!r}")
     body: dict[str, Any] = {"accountId": account_id, "currency": currency_map[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
-    return _fmt(data)
+    # The two dropped fields are deprecated in the API contract.
+    return _fmt(_trimmed(
+        data, "positions", "virtualPositions", drop=("averagePositionPricePt", "quantityLots"),
+    ))
 
 
 @read_only_tool
@@ -285,12 +365,13 @@ async def get_positions(account_id: str) -> str:
     """Get all positions in an account: securities, futures, options, and cash balances.
 
     Unlike get_portfolio, this returns raw position balances without price calculations.
+    A field that is zero or false (blocked, exchangeBlocked) is left out.
 
     Args:
         account_id: Account ID (get from get_accounts)
     """
     data = await _call("OperationsService", "GetPositions", {"accountId": account_id})
-    return _fmt(data)
+    return _fmt(_trimmed(data, "securities", "futures", "options"))
 
 
 @read_only_tool
@@ -321,6 +402,7 @@ async def get_operations(
 
     Returns: buys, sells, dividends, coupons, taxes, commissions, deposits, withdrawals, etc.
     Each operation has: id, type, date, payment amount, instrument info, quantity, trades.
+    A field that is zero or empty is left out.
 
     Note: for large histories use get_operations_by_cursor instead.
 
@@ -344,7 +426,7 @@ async def get_operations(
     if figi:
         body["figi"] = figi
     data = await _call("OperationsService", "GetOperations", body)
-    return _fmt(data)
+    return _fmt(_trimmed(data, "operations"))
 
 
 @read_only_tool
@@ -362,8 +444,9 @@ async def get_operations_by_cursor(
 ) -> str:
     """Get operations with cursor-based pagination. Better for large histories.
 
-    Returns has_next flag and next_cursor for pagination. Each operation item includes
+    Returns hasNext and nextCursor for pagination. Each operation item includes
     detailed info: payment, price, commission, yield, quantity, trades, ticker.
+    A field that is zero or empty is left out.
 
     Common operation types: BUY, SELL, DIVIDEND, COUPON, TAX, BOND_TAX, INPUT, OUTPUT,
     BROKER_FEE, BOND_REPAYMENT_FULL, BOND_REPAYMENT.
@@ -402,7 +485,7 @@ async def get_operations_by_cursor(
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
-    return _fmt(data)
+    return _fmt(_trimmed(data, "items"))
 
 
 # ── Instruments ──────────────────────────────────────────────────────────────
@@ -511,6 +594,7 @@ async def get_bond_events(
 
     Without dates the API returns only a window of a few years around today, so a bond's
     maturity or a distant offer needs an explicit from_date/to_date range to show up.
+    A field of an event that is zero or empty is left out.
 
     Args:
         instrument_id: Bond FIGI or UID
@@ -529,7 +613,7 @@ async def get_bond_events(
     if to_date:
         body["to"] = _ts(_parse_date(to_date, end_of_day=True))
     data = await _call("InstrumentsService", "GetBondEvents", body)
-    return _fmt(data)
+    return _fmt(_trimmed(data, "events"))
 
 
 @read_only_tool
@@ -926,13 +1010,23 @@ async def get_candles(
 ) -> str:
     """Get historical candles (OHLCV) for an instrument.
 
+    Returns {"columns": ["time", "open", "high", "low", "close", "volume"], "candles": [...]}:
+    one row per candle, oldest first, in the order of "columns". Volume is in lots. For day,
+    week and month candles "time" is a date. "last_candle_complete": false appears when the
+    last candle's period is still running — its close is the current price, not a close.
+
+    The API limits the period one request may span: a day for minute candles, a week for
+    5-10 minute ones, 3 weeks for 15-30 minute ones, 3 months for hourly ones, 6 years for
+    daily ones.
+
     Args:
         instrument_id: Instrument FIGI or UID
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         interval: Candle interval — CANDLE_INTERVAL_1_MIN, CANDLE_INTERVAL_5_MIN,
                   CANDLE_INTERVAL_15_MIN, CANDLE_INTERVAL_HOUR, CANDLE_INTERVAL_DAY,
-                  CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH
+                  CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH (also 5/10/30_SEC,
+                  2/3/10/30_MIN, 2/4_HOUR)
     """
     now = datetime.now(timezone.utc)
     data = await _call("MarketDataService", "GetCandles", {
@@ -941,7 +1035,26 @@ async def get_candles(
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),
         "interval": interval,
     })
-    return _fmt(data)
+    candles = data.get("candles", [])
+    dates_only = interval in ("CANDLE_INTERVAL_DAY", "CANDLE_INTERVAL_WEEK", "CANDLE_INTERVAL_MONTH")
+
+    def price(candle: dict, key: str) -> int | float | None:
+        return _number(candle[key]) if candle.get(key) else None
+
+    result: dict[str, Any] = {
+        "columns": ["time", "open", "high", "low", "close", "volume"],
+        "candles": [
+            [
+                c.get("time", "")[:10] if dates_only else c.get("time", ""),
+                price(c, "open"), price(c, "high"), price(c, "low"), price(c, "close"),
+                int(c.get("volume") or 0),
+            ]
+            for c in candles
+        ],
+    }
+    if candles and not candles[-1].get("isComplete", True):
+        result["last_candle_complete"] = False
+    return _fmt(result)
 
 
 @read_only_tool

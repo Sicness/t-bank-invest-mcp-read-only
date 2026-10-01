@@ -20,6 +20,15 @@ def make_call_mock(return_value=None):
     return AsyncMock(return_value=return_value)
 
 
+SBER = {
+    "ticker": "SBER", "classCode": "TQBR", "name": "Сбер Банк", "instrumentType": "share",
+    "instrumentKind": "INSTRUMENT_TYPE_SHARE", "uid": "e6123145-9665-43e0-8413-cd61b8aa9b13",
+    "figi": "BBG004730N88", "isin": "RU0009029540", "lot": 1, "apiTradeAvailableFlag": True,
+    "forQualInvestorFlag": False, "forIisFlag": True, "weekendFlag": True, "blockedTcaFlag": False,
+    "positionUid": "41eb2102-5333-4713-bf15-72b204c4bf7b",
+}
+
+
 # ── UsersService ─────────────────────────────────────────────────────────────
 
 
@@ -1342,3 +1351,162 @@ class TestReturnFormatting:
             result = await srv.find_instrument("test")
         assert "Газпром" in result
         assert "\\u" not in result
+
+    async def test_amounts_are_plain_numbers_in_every_tool(self):
+        mock = make_call_mock({"lastPrices": [{"figi": "F", "price": {"units": "274", "nano": 270000000}}]})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_last_prices("e6123145-9665-43e0-8413-cd61b8aa9b13"))
+        assert result == {"lastPrices": [{"figi": "F", "price": 274.27}]}
+
+
+# ── Output shaping ────────────────────────────────────────────────────────────
+
+
+def money(units, nano=0, currency="rub"):
+    return {"currency": currency, "units": str(units), "nano": nano}
+
+
+def quotation(units, nano=0):
+    return {"units": str(units), "nano": nano}
+
+
+PORTFOLIO = {
+    "accountId": "acc1",
+    "totalAmountShares": money(150000),
+    "totalAmountBonds": money(0),
+    "totalAmountPortfolio": money(150000, 500000000),
+    "expectedYield": quotation(3, 250000000),
+    "positions": [{
+        "figi": "BBG004730N88", "instrumentType": "share", "ticker": "SBER", "classCode": "TQBR",
+        "instrumentUid": SBER["uid"], "positionUid": SBER["positionUid"],
+        "quantity": quotation(100), "quantityLots": quotation(100),
+        "averagePositionPrice": money(270, 100000000), "averagePositionPriceFifo": money(269),
+        "averagePositionPricePt": quotation(0), "currentPrice": money(274, 270000000),
+        "currentNkd": money(0), "expectedYield": quotation(417), "expectedYieldFifo": quotation(527),
+        "dailyYield": money(-35), "blocked": False, "blockedLots": quotation(0),
+        "varMargin": money(0, currency=""), "varMarginSettled": money(0, currency=""),
+    }],
+    "virtualPositions": [],
+}
+
+
+class TestPortfolioShaping:
+    async def test_amounts_are_numbers_with_one_currency_per_object(self):
+        with patch.object(srv, "_call", make_call_mock(PORTFOLIO)):
+            result = json.loads(await srv.get_portfolio("acc1"))
+        assert result["currency"] == "rub"
+        assert result["totalAmountPortfolio"] == 150000.5
+        assert result["totalAmountBonds"] == 0  # totals are kept even when zero
+        assert result["expectedYield"] == 3.25
+
+    async def test_position_drops_zero_false_and_deprecated_fields(self):
+        with patch.object(srv, "_call", make_call_mock(PORTFOLIO)):
+            result = json.loads(await srv.get_portfolio("acc1"))
+        assert result["positions"] == [{
+            "currency": "rub",
+            "figi": "BBG004730N88", "instrumentType": "share", "ticker": "SBER", "classCode": "TQBR",
+            "instrumentUid": SBER["uid"], "positionUid": SBER["positionUid"],
+            "quantity": 100,
+            "averagePositionPrice": 270.1, "averagePositionPriceFifo": 269,
+            "currentPrice": 274.27,
+            "expectedYield": 417, "expectedYieldFifo": 527,
+            "dailyYield": -35,
+        }]
+
+    async def test_real_sized_portfolio_is_several_times_smaller(self):
+        big = {**PORTFOLIO, "positions": PORTFOLIO["positions"] * 100}
+        with patch.object(srv, "_call", make_call_mock(big)):
+            result = await srv.get_portfolio("acc1")
+        raw = json.dumps(big, ensure_ascii=False, separators=(",", ":"))
+        assert len(result) < len(raw) / 2
+
+    async def test_positions_trimmed(self):
+        data = {
+            "money": [money(1500, 500000000), money(20, currency="usd")],
+            "blocked": [],
+            "securities": [{"figi": "F", "blocked": "0", "balance": "10", "exchangeBlocked": False,
+                            "instrumentType": "share", "ticker": "SBER"}],
+            "limitsLoadingInProgress": False,
+            "futures": [], "options": [], "accountId": "acc1",
+        }
+        with patch.object(srv, "_call", make_call_mock(data)):
+            result = json.loads(await srv.get_positions("acc1"))
+        assert result["money"] == [{"value": 1500.5, "currency": "rub"}, {"value": 20, "currency": "usd"}]
+        assert result["securities"] == [{"figi": "F", "balance": "10", "instrumentType": "share", "ticker": "SBER"}]
+        assert result["limitsLoadingInProgress"] is False  # only list items are trimmed
+
+    async def test_operations_trimmed(self):
+        item = {"id": "1", "type": "OPERATION_TYPE_BUY", "payment": money(-27410), "price": money(274, 100000000),
+                "commission": money(-13, -700000000), "yield": money(0), "accruedInt": money(0),
+                "yieldRelative": quotation(0), "quantity": "100", "quantityRest": "0", "cancelReason": "",
+                "tradesInfo": {"trades": []}, "childOperations": []}
+        with patch.object(srv, "_call", make_call_mock({"hasNext": False, "nextCursor": "", "items": [item]})):
+            result = json.loads(await srv.get_operations_by_cursor("acc1"))
+        assert result["items"] == [{
+            "currency": "rub", "id": "1", "type": "OPERATION_TYPE_BUY", "payment": -27410, "price": 274.1,
+            "commission": -13.7, "quantity": "100", "tradesInfo": {"trades": []},
+        }]
+        with patch.object(srv, "_call", make_call_mock({"operations": [item]})):
+            result = json.loads(await srv.get_operations("acc1"))
+        assert result["operations"][0]["payment"] == -27410
+        assert "yield" not in result["operations"][0]
+
+    async def test_bond_events_trimmed(self):
+        event = {"instrumentId": "uid", "eventNumber": 12, "eventDate": "2026-12-02T00:00:00Z",
+                 "eventType": "EVENT_TYPE_CPN", "eventTotalVol": quotation(0), "payOneBond": money(35, 400000000),
+                 "couponInterestRate": quotation(7, 100000000), "note": "", "convertToFinToolId": ""}
+        with patch.object(srv, "_call", make_call_mock({"events": [event]})):
+            result = json.loads(await srv.get_bond_events(SBER["uid"]))
+        assert result == {"events": [{
+            "currency": "rub", "instrumentId": "uid", "eventNumber": 12, "eventDate": "2026-12-02T00:00:00Z",
+            "eventType": "EVENT_TYPE_CPN", "payOneBond": 35.4, "couponInterestRate": 7.1,
+        }]}
+
+
+def raw_candle(time, o, h, l, c, volume, complete=True):
+    return {"time": time, "open": quotation(o), "high": quotation(h), "low": quotation(l),
+            "close": quotation(c, 500000000), "volume": str(volume), "isComplete": complete,
+            "candleSource": "CANDLE_SOURCE_EXCHANGE", "volumeBuy": "1", "volumeSell": "2"}
+
+
+class TestCandleRows:
+    async def test_daily_candles_as_rows_with_dates(self):
+        data = {"candles": [raw_candle("2026-09-29T00:00:00Z", 270, 275, 269, 273, 1000),
+                            raw_candle("2026-09-30T00:00:00Z", 273, 276, 272, 274, 2000)]}
+        with patch.object(srv, "_call", make_call_mock(data)):
+            result = json.loads(await srv.get_candles(SBER["uid"]))
+        assert result == {
+            "columns": ["time", "open", "high", "low", "close", "volume"],
+            "candles": [["2026-09-29", 270, 275, 269, 273.5, 1000], ["2026-09-30", 273, 276, 272, 274.5, 2000]],
+        }
+
+    async def test_intraday_candles_keep_the_time(self):
+        data = {"candles": [raw_candle("2026-09-30T07:00:00Z", 270, 275, 269, 273, 1000)]}
+        with patch.object(srv, "_call", make_call_mock(data)):
+            result = json.loads(await srv.get_candles(SBER["uid"], interval="CANDLE_INTERVAL_HOUR"))
+        assert result["candles"][0][0] == "2026-09-30T07:00:00Z"
+
+    async def test_unfinished_last_candle_is_flagged(self):
+        data = {"candles": [raw_candle("2026-09-30T00:00:00Z", 270, 275, 269, 273, 1000),
+                            raw_candle("2026-10-01T00:00:00Z", 273, 276, 272, 274, 50, complete=False)]}
+        with patch.object(srv, "_call", make_call_mock(data)):
+            result = json.loads(await srv.get_candles(SBER["uid"]))
+        assert result["last_candle_complete"] is False
+        assert len(result["candles"]) == 2
+
+    async def test_no_candles(self):
+        with patch.object(srv, "_call", make_call_mock({"candles": []})):
+            result = json.loads(await srv.get_candles(SBER["uid"]))
+        assert result["candles"] == []
+        assert "last_candle_complete" not in result
+
+    async def test_candle_with_a_missing_price(self):
+        with patch.object(srv, "_call", make_call_mock({"candles": [{"time": "2026-09-30T00:00:00Z"}]})):
+            result = json.loads(await srv.get_candles(SBER["uid"]))
+        assert result["candles"] == [["2026-09-30", None, None, None, None, 0]]
+
+    async def test_a_year_of_candles_is_several_times_smaller(self):
+        data = {"candles": [raw_candle(f"2026-01-{d % 28 + 1:02}T00:00:00Z", 270, 275, 269, 273, 874332) for d in range(250)]}
+        with patch.object(srv, "_call", make_call_mock(data)):
+            result = await srv.get_candles(SBER["uid"])
+        assert len(result) < len(json.dumps(data, separators=(",", ":"))) / 4
