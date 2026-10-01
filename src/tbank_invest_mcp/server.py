@@ -19,7 +19,7 @@ import certifi
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from tbank_invest_mcp import __version__
 
@@ -88,8 +88,32 @@ INSTRUMENT_KINDS = (
     "INDEX", "COMMODITY",
 )
 PORTFOLIO_CURRENCIES = {"RUB": 0, "USD": 1, "EUR": 2}  # GetPortfolio takes the number
+INSTRUMENT_STATUSES = ("BASE", "ALL")
 OPERATION_STATES = ("EXECUTED", "CANCELED", "PROGRESS")
+# enum OperationType of operations.proto. Not small, but checked all the same: a misspelt
+# type (DIVIDENDS) would be answered with every operation of the period.
+OPERATION_TYPES = (
+    "INPUT", "BOND_TAX", "OUTPUT_SECURITIES", "OVERNIGHT", "TAX", "BOND_REPAYMENT_FULL",
+    "SELL_CARD", "DIVIDEND_TAX", "OUTPUT", "BOND_REPAYMENT", "TAX_CORRECTION", "SERVICE_FEE",
+    "BENEFIT_TAX", "MARGIN_FEE", "BUY", "BUY_CARD", "INPUT_SECURITIES", "SELL_MARGIN",
+    "BROKER_FEE", "BUY_MARGIN", "DIVIDEND", "SELL", "COUPON", "SUCCESS_FEE",
+    "DIVIDEND_TRANSFER", "ACCRUING_VARMARGIN", "WRITING_OFF_VARMARGIN", "DELIVERY_BUY",
+    "DELIVERY_SELL", "TRACK_MFEE", "TRACK_PFEE", "TAX_PROGRESSIVE", "BOND_TAX_PROGRESSIVE",
+    "DIVIDEND_TAX_PROGRESSIVE", "BENEFIT_TAX_PROGRESSIVE", "TAX_CORRECTION_PROGRESSIVE",
+    "TAX_REPO_PROGRESSIVE", "TAX_REPO", "TAX_REPO_HOLD", "TAX_REPO_REFUND",
+    "TAX_REPO_HOLD_PROGRESSIVE", "TAX_REPO_REFUND_PROGRESSIVE", "DIV_EXT",
+    "TAX_CORRECTION_COUPON", "CASH_FEE", "OUT_FEE", "OUT_STAMP_DUTY", "OUTPUT_SWIFT",
+    "INPUT_SWIFT", "OUTPUT_ACQUIRING", "INPUT_ACQUIRING", "OUTPUT_PENALTY", "ADVICE_FEE",
+    "TRANS_IIS_BS", "TRANS_BS_BS", "OUT_MULTI", "INP_MULTI", "OVER_PLACEMENT", "OVER_COM",
+    "OVER_INCOME", "OPTION_EXPIRATION", "FUTURE_EXPIRATION",
+)
 BOND_EVENT_TYPES = ("CPN", "CALL", "MTY", "CONV")
+CANDLE_INTERVALS = (
+    "5_SEC", "10_SEC", "30_SEC", "1_MIN", "2_MIN", "3_MIN", "5_MIN", "10_MIN", "15_MIN",
+    "30_MIN", "HOUR", "2_HOUR", "4_HOUR", "DAY", "WEEK", "MONTH",
+)
+INDICATOR_TYPES = ("SMA", "EMA", "RSI", "MACD", "BB")
+PRICE_TYPES = ("CLOSE", "OPEN", "HIGH", "LOW", "AVG")
 # GetTechAnalysis names the same intervals differently from GetCandles.
 INDICATOR_INTERVALS = {
     "CANDLE_INTERVAL_1_MIN": "INDICATOR_INTERVAL_ONE_MINUTE",
@@ -108,28 +132,19 @@ INDICATOR_INTERVALS = {
 }
 
 InstrumentIdType = _choices(*("INSTRUMENT_ID_TYPE_" + t for t in INSTRUMENT_ID_TYPES))
-InstrumentStatus = _choices("INSTRUMENT_STATUS_BASE", "INSTRUMENT_STATUS_ALL")
+InstrumentStatus = _choices(*("INSTRUMENT_STATUS_" + s for s in INSTRUMENT_STATUSES))
 InstrumentKind = _choices("", *(k.lower() for k in INSTRUMENT_KINDS))
 PortfolioCurrency = _choices(*PORTFOLIO_CURRENCIES)
 OperationState = _choices("", *OPERATION_STATES)
 BondEventType = _choices("", *BOND_EVENT_TYPES)
-CandleInterval = _choices(
-    "CANDLE_INTERVAL_5_SEC", "CANDLE_INTERVAL_10_SEC", "CANDLE_INTERVAL_30_SEC",
-    "CANDLE_INTERVAL_1_MIN", "CANDLE_INTERVAL_2_MIN", "CANDLE_INTERVAL_3_MIN",
-    "CANDLE_INTERVAL_5_MIN", "CANDLE_INTERVAL_10_MIN", "CANDLE_INTERVAL_15_MIN",
-    "CANDLE_INTERVAL_30_MIN", "CANDLE_INTERVAL_HOUR", "CANDLE_INTERVAL_2_HOUR",
-    "CANDLE_INTERVAL_4_HOUR", "CANDLE_INTERVAL_DAY", "CANDLE_INTERVAL_WEEK",
-    "CANDLE_INTERVAL_MONTH",
-)
-IndicatorType = _choices(
-    "INDICATOR_TYPE_SMA", "INDICATOR_TYPE_EMA", "INDICATOR_TYPE_RSI", "INDICATOR_TYPE_MACD",
-    "INDICATOR_TYPE_BB",
-)
-IndicatorInterval = _choices(*INDICATOR_INTERVALS.values())
-TypeOfPrice = _choices(
-    "TYPE_OF_PRICE_CLOSE", "TYPE_OF_PRICE_OPEN", "TYPE_OF_PRICE_HIGH", "TYPE_OF_PRICE_LOW",
-    "TYPE_OF_PRICE_AVG",
-)
+CandleInterval = _choices(*("CANDLE_INTERVAL_" + i for i in CANDLE_INTERVALS))
+IndicatorType = _choices(*("INDICATOR_TYPE_" + i for i in INDICATOR_TYPES))
+# The names GetCandles uses are listed too: this parameter took them before it was found
+# that the API wants its own, and they are still translated.
+IndicatorInterval = _choices(*INDICATOR_INTERVALS.values(), *INDICATOR_INTERVALS)
+TypeOfPrice = _choices(*("TYPE_OF_PRICE_" + p for p in PRICE_TYPES))
+# An account id is all digits, and a model now and then sends it as a number.
+AccountId = Annotated[str, BeforeValidator(str)]
 
 
 def _get_token() -> str:
@@ -552,6 +567,15 @@ def _csv(values: str) -> list[str]:
     return [v.strip() for v in values.split(",") if v.strip()]
 
 
+def _given(values: str, parameter: str) -> list[str]:
+    """The items of a comma-separated list that must not be empty: asked about no
+    instrument at all, the API answers with every instrument on the market."""
+    given = _csv(values)
+    if not given:
+        raise ValueError(f"{parameter} is empty: name at least one instrument")
+    return given
+
+
 async def _each(identifiers: list[str], resolve: Callable[[str], Any]) -> list[str]:
     """resolve() for every identifier of a list: each distinct one once, a few at a time."""
     distinct = list(dict.fromkeys(identifiers))
@@ -584,7 +608,7 @@ async def get_user_info() -> str:
 
 
 @read_only_tool
-async def get_margin_attributes(account_id: str) -> str:
+async def get_margin_attributes(account_id: AccountId) -> str:
     """Get margin trading attributes for an account: liquid portfolio value, starting/minimal margin, funds sufficiency.
 
     Args:
@@ -598,7 +622,7 @@ async def get_margin_attributes(account_id: str) -> str:
 
 
 @read_only_tool
-async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") -> str:
+async def get_portfolio(account_id: AccountId, currency: PortfolioCurrency = "RUB") -> str:
     """Get full portfolio for an account: total values by asset type, all positions with prices, yields, and quantities.
 
     Each position has ticker, classCode, figi, instrumentUid, positionUid, instrumentType,
@@ -627,7 +651,7 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
 
 
 @read_only_tool
-async def get_positions(account_id: str) -> str:
+async def get_positions(account_id: AccountId) -> str:
     """Get all positions in an account: securities, futures, options, and cash balances.
 
     Unlike get_portfolio, this returns raw position balances without price calculations.
@@ -643,7 +667,7 @@ async def get_positions(account_id: str) -> str:
 
 
 @read_only_tool
-async def get_withdraw_limits(account_id: str) -> str:
+async def get_withdraw_limits(account_id: AccountId) -> str:
     """Get available withdrawal limits for an account: free cash, blocked amounts, futures guarantees.
 
     Args:
@@ -663,11 +687,13 @@ async def get_withdraw_limits(account_id: str) -> str:
 # is operationType: in GetOperations `type` is a description in Russian and operationType
 # the only code.
 _OPERATION_REPEATS = ("instrumentKind", "assetUid", "brokerAccountId", "cursor")
+# GetOperations has no paging and silently stops at this many operations.
+OPERATIONS_CAP = 1000
 
 
 @read_only_tool
 async def get_operations(
-    account_id: str,
+    account_id: AccountId,
     from_date: str = "",
     to_date: str = "",
     state: OperationState = "",
@@ -687,8 +713,11 @@ async def get_operations(
     their difference. A bond repayment has no quantity. Prices and quantities are as they
     were at the time: unlike candles, they are not adjusted for later splits.
 
-    Note: this method has no paging and an active account has hundreds of operations a
-    year — keep the range to a month or two, or use get_operations_by_cursor.
+    Note: this method has no paging. A month of an active account is about 60 operations
+    and 26,000 characters, two months no longer fit into a client's limit — keep the range
+    to a month, or use get_operations_by_cursor. The API returns no more than 1000
+    operations, the latest ones; when that happens the result starts with a "note" saying
+    so, and the earlier operations are not in it.
 
     Args:
         account_id: Account ID
@@ -706,12 +735,20 @@ async def get_operations(
         instrument = None if _FIGI_RE.fullmatch(figi) else await _find_exact(figi)
         body["figi"] = (instrument or {}).get("figi") or figi
     data = await _call("OperationsService", "GetOperations", body)
+    operations = data.get("operations", [])
+    if len(operations) >= OPERATIONS_CAP:
+        earliest = min((o.get("date", "") for o in operations), default="")
+        data = {"note": (
+            f"Cut off: the API returns at most {OPERATIONS_CAP} operations per request, the "
+            f"latest ones. Operations before {earliest} are missing from this result. Use "
+            "get_operations_by_cursor, or ask for a shorter range."
+        ), **data}
     return _fmt(data, "operations", drop=_OPERATION_REPEATS)
 
 
 @read_only_tool
 async def get_operations_by_cursor(
-    account_id: str,
+    account_id: AccountId,
     from_date: str = "",
     to_date: str = "",
     cursor: str = "",
@@ -751,7 +788,8 @@ async def get_operations_by_cursor(
         limit: Number of operations per page (1-1000, default: 50; a page of 50 is about
             28,000 characters, and a client refuses a result twice that)
         instrument_id: Filter by instrument — ticker, FIGI, ISIN or UID
-        operation_types: Comma-separated operation types (e.g. "BUY,SELL,DIVIDEND")
+        operation_types: Comma-separated operation types (e.g. "BUY,SELL,DIVIDEND"); a type
+            the API does not have is an error
         state: Filter by state: EXECUTED, CANCELED, PROGRESS
         without_commissions: Exclude commission operations
         without_trades: Exclude trade details from response
@@ -768,7 +806,9 @@ async def get_operations_by_cursor(
     if instrument_id:
         body["instrumentId"] = await _uid(instrument_id)
     if operation_types:
-        body["operationTypes"] = [_enum(t, "OPERATION_TYPE_") for t in _csv(operation_types)]
+        body["operationTypes"] = [
+            _enum(t, "OPERATION_TYPE_", OPERATION_TYPES) for t in _csv(operation_types)
+        ]
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
@@ -1085,7 +1125,7 @@ async def get_asset_fundamentals(assets: str) -> str:
     Args:
         assets: Comma-separated list of tickers, FIGIs, ISINs, instrument UIDs or asset UIDs
     """
-    asset_list = await _each(_csv(assets), _asset_uid_for)
+    asset_list = await _each(_given(assets, "assets"), _asset_uid_for)
     data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": asset_list})
     return _fmt(data)
 
@@ -1381,7 +1421,7 @@ async def get_candles(
                   CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH (also 5/10/30_SEC,
                   2/3/10/30_MIN, 2/4_HOUR)
     """
-    interval = _enum(interval, "CANDLE_INTERVAL_")
+    interval = _enum(interval, "CANDLE_INTERVAL_", CANDLE_INTERVALS)
     data = await _call("MarketDataService", "GetCandles", {
         "instrumentId": await _uid(instrument_id),
         **_period(from_date, to_date, back=30),
@@ -1412,20 +1452,37 @@ async def get_candles(
     return _fmt(result)
 
 
-async def _uids(instrument_ids: str) -> list[str]:
-    """Instrument UIDs for a comma-separated list of tickers, FIGIs, ISINs or UIDs."""
-    return await _each(_csv(instrument_ids), _uid)
+def _unknown_marked(prices: list[dict], given: list[str]) -> list[dict]:
+    """prices with the API's empty records replaced by the identifier that was not found.
+
+    GetLastPrices and GetClosePrices answer in the order of the request, and for an
+    identifier they do not know send a record with every field empty.
+    """
+    if len(prices) != len(given):
+        return prices
+    return [
+        price if price.get("instrumentUid") or price.get("figi")
+        else {"requested": identifier, "error": "No instrument matches this identifier"}
+        for price, identifier in zip(prices, given)
+    ]
 
 
 @read_only_tool
 async def get_last_prices(instrument_ids: str) -> str:
     """Get last trade prices for one or more instruments.
 
+    The prices come in the order of the request, each with its ticker and classCode. An
+    identifier no instrument matches gives {"requested": ..., "error": ...} in its place.
+    A bond's price is in percent of its nominal, not in money.
+
     Args:
         instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
-    ids = await _uids(instrument_ids)
+    given = _given(instrument_ids, "instrument_ids")
+    ids = await _each(given, _uid)
     data = await _call("MarketDataService", "GetLastPrices", {"instrumentId": ids})
+    if "lastPrices" in data:
+        data["lastPrices"] = _unknown_marked(data["lastPrices"], given)
     return _fmt(data)
 
 
@@ -1448,11 +1505,18 @@ async def get_order_book(instrument_id: str, depth: int = 20) -> str:
 async def get_close_prices(instrument_ids: str) -> str:
     """Get previous trading session close prices for instruments.
 
+    The prices come in the order of the request. An identifier no instrument matches gives
+    {"requested": ..., "error": ...} in its place. A bond's price is in percent of its
+    nominal, not in money.
+
     Args:
         instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
-    instruments = [{"instrumentId": i} for i in await _uids(instrument_ids)]
+    given = _given(instrument_ids, "instrument_ids")
+    instruments = [{"instrumentId": i} for i in await _each(given, _uid)]
     data = await _call("MarketDataService", "GetClosePrices", {"instruments": instruments})
+    if "closePrices" in data:
+        data["closePrices"] = _unknown_marked(data["closePrices"], given)
     return _fmt(data)
 
 
@@ -1504,10 +1568,16 @@ async def get_tech_analysis(
         slow_length: MACD only — period of the slow EMA (default: 26)
         signal_smoothing: MACD only — period of the signal line (default: 9)
     """
-    indicator_type = _enum(indicator_type, "INDICATOR_TYPE_")
+    indicator_type = _enum(indicator_type, "INDICATOR_TYPE_", INDICATOR_TYPES)
+    given_interval = interval
     candle_name = _enum(interval, "CANDLE_INTERVAL_")
     interval = INDICATOR_INTERVALS.get(candle_name) or _enum(interval, "INDICATOR_INTERVAL_")
-    type_of_price = _enum(type_of_price, "TYPE_OF_PRICE_")
+    if interval not in INDICATOR_INTERVALS.values():
+        raise ValueError(
+            f"Unknown value {given_interval!r}; expected one of: "
+            + ", ".join(INDICATOR_INTERVALS.values())
+        )
+    type_of_price = _enum(type_of_price, "TYPE_OF_PRICE_", PRICE_TYPES)
     body: dict[str, Any] = {
         "instrumentUid": await _uid(instrument_id, figi_ok=False),
         "indicatorType": indicator_type,
@@ -1533,7 +1603,7 @@ async def get_tech_analysis(
 
 
 @read_only_tool
-async def get_orders(account_id: str) -> str:
+async def get_orders(account_id: AccountId) -> str:
     """Get list of active (pending) orders for an account.
 
     Returns: order_id, direction, type, status, price, quantity, instrument info.
@@ -1546,7 +1616,7 @@ async def get_orders(account_id: str) -> str:
 
 
 @read_only_tool
-async def get_order_state(account_id: str, order_id: str) -> str:
+async def get_order_state(account_id: AccountId, order_id: str) -> str:
     """Get detailed status of a specific order: execution status, filled quantity, average price.
 
     Args:
@@ -1576,7 +1646,7 @@ async def list_shares(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_B
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
     data = await _call("InstrumentsService", "Shares", {
-        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_", INSTRUMENT_STATUSES),
     })
     return _fmt(data)
 
@@ -1595,7 +1665,7 @@ async def list_bonds(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BA
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
     data = await _call("InstrumentsService", "Bonds", {
-        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_", INSTRUMENT_STATUSES),
     })
     return _fmt(data)
 
@@ -1613,7 +1683,7 @@ async def list_etfs(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BAS
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
     data = await _call("InstrumentsService", "Etfs", {
-        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_", INSTRUMENT_STATUSES),
     })
     return _fmt(data)
 
@@ -1629,7 +1699,7 @@ async def list_currencies(instrument_status: InstrumentStatus = "INSTRUMENT_STAT
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
     data = await _call("InstrumentsService", "Currencies", {
-        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_", INSTRUMENT_STATUSES),
     })
     return _fmt(data)
 
@@ -1648,7 +1718,7 @@ async def list_futures(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
     data = await _call("InstrumentsService", "Futures", {
-        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_", INSTRUMENT_STATUSES),
     })
     return _fmt(data)
 

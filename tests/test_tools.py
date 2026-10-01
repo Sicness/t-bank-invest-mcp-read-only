@@ -2093,3 +2093,76 @@ class TestInstrumentListStatus:
         with patch.object(srv, "_call", mock):
             await srv.list_shares("all")
         assert mock.call_args[0][2] == {"instrumentStatus": "INSTRUMENT_STATUS_ALL"}
+
+
+class TestSilentlyWrongAnswers:
+    """Things the API answers without complaint and with the wrong data; the server must not."""
+
+    @pytest.mark.parametrize("types", ["DIVIDENDS", "FOO", "COUPON,FOO"])
+    async def test_unknown_operation_type_is_rejected(self, types):
+        # The API ignores a type it does not know and returns every operation of the period.
+        mock = make_call_mock({"items": []})
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="Unknown value"):
+                await srv.get_operations_by_cursor("acc1", operation_types=types)
+        mock.assert_not_called()
+
+    @pytest.mark.parametrize("known", ["INP_MULTI", "DIV_EXT", "OPERATION_TYPE_BOND_REPAYMENT_FULL", "coupon"])
+    async def test_real_operation_types_pass(self, known):
+        mock = make_call_mock({"items": []})
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations_by_cursor("acc1", operation_types=known)
+        assert mock.call_args[0][2]["operationTypes"] == [
+            "OPERATION_TYPE_" + known.upper().removeprefix("OPERATION_TYPE_")
+        ]
+
+    async def test_operations_cut_off_by_the_api_say_so(self):
+        operations = [{"id": str(n), "date": f"2026-{1 + n % 9:02d}-15T10:00:00Z"} for n in range(1000)]
+        with patch.object(srv, "_call", make_call_mock({"operations": operations})):
+            text = await srv.get_operations("acc1", from_date="2025-10-01", to_date="2026-09-30")
+        result = json.loads(text)
+        assert text.startswith('{"note":')  # first, so that it is read even from a saved file
+        assert "at most 1000" in result["note"] and "before 2026-01-15T10:00:00Z" in result["note"]
+        assert len(result["operations"]) == 1000
+
+    async def test_a_complete_list_of_operations_has_no_note(self):
+        with patch.object(srv, "_call", make_call_mock({"operations": [{"id": "1"}] * 999})):
+            assert "note" not in json.loads(await srv.get_operations("acc1"))
+
+    @pytest.mark.parametrize("tool", [srv.get_last_prices, srv.get_close_prices, srv.get_asset_fundamentals])
+    @pytest.mark.parametrize("empty", ["", " ", ",", " , "])
+    async def test_an_empty_list_is_not_a_request_for_the_whole_market(self, tool, empty):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="name at least one instrument"):
+                await tool(empty)
+        mock.assert_not_called()
+
+    async def test_unknown_identifier_in_a_price_list_is_named(self):
+        # The API answers it with a record whose every field is empty, in its place in the list.
+        stub = {"figi": "", "ticker": "", "classCode": "", "instrumentUid": "", "lastPriceType": "LAST_PRICE_UNSPECIFIED"}
+        price = {"figi": "BBG004730N88", "ticker": "SBER", "instrumentUid": SBER["uid"], "price": quotation(274)}
+        mock = route(FindInstrument=search_results(SBER), GetLastPrices={"lastPrices": [price, stub]},
+                     GetClosePrices={"closePrices": [{"figi": "", "instrumentUid": ""}, price]})
+        with patch.object(srv, "_call", mock):
+            last = json.loads(await srv.get_last_prices("SBER, NOPE123"))
+            close = json.loads(await srv.get_close_prices("NOPE123,SBER"))
+        assert last["lastPrices"][0]["price"] == 274
+        assert last["lastPrices"][1] == {"requested": "NOPE123", "error": "No instrument matches this identifier"}
+        assert close["closePrices"][0]["requested"] == "NOPE123"
+        assert close["closePrices"][1]["ticker"] == "SBER"
+
+    @pytest.mark.parametrize("call", [
+        lambda: srv.list_currencies("FOO"),
+        lambda: srv.get_candles(SBER["uid"], interval="CANDLE_INTERVAL_FORTNIGHT"),
+        lambda: srv.get_tech_analysis(SBER["uid"], "INDICATOR_TYPE_MA"),
+        lambda: srv.get_tech_analysis(SBER["uid"], "INDICATOR_TYPE_RSI", interval="FORTNIGHT"),
+        lambda: srv.get_tech_analysis(SBER["uid"], "INDICATOR_TYPE_RSI", type_of_price="MEDIAN"),
+    ])
+    async def test_unknown_enum_values_are_rejected(self, call):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="Unknown value"):
+                await call()
+        mock.assert_not_called()
+
