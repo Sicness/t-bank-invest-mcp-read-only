@@ -560,10 +560,15 @@ async def get_margin_attributes(account_id: str) -> str:
 async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") -> str:
     """Get full portfolio for an account: total values by asset type, all positions with prices, yields, and quantities.
 
-    Each position has ticker, classCode, figi, instrumentUid, instrumentType, quantity,
-    averagePositionPrice, currentPrice, expectedYield, dailyYield, currentNkd (bonds) and its
-    `currency`. Amounts are plain numbers; a field that is zero or false is left out, and so
-    are positionUid and the two fields the API has deprecated.
+    Each position has ticker, classCode, figi, instrumentUid, positionUid, instrumentType,
+    quantity, averagePositionPrice, currentPrice, expectedYield, dailyYield, currentNkd
+    (bonds) and its `currency`. Amounts are plain numbers; a field that is zero or false is
+    left out, and so are the two fields the API has deprecated.
+
+    expectedYield and dailyYield of a position are amounts of money in the position's
+    currency, not percentages; the portfolio's own expectedYield, at the top level, is a
+    percentage. positionUid is the key of a position: one paper can come under several
+    figi and instrumentUid (its listings), all with the same positionUid.
 
     Args:
         account_id: Account ID (get from get_accounts)
@@ -574,11 +579,9 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
         raise ValueError(f"currency must be one of {', '.join(PORTFOLIO_CURRENCIES)}, got {currency!r}")
     body: dict[str, Any] = {"accountId": account_id, "currency": PORTFOLIO_CURRENCIES[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
-    # averagePositionPricePt and quantityLots are deprecated in the API contract. positionUid
-    # is a second identifier of what instrumentUid already names, and a seventh of the size.
+    # The two dropped fields are deprecated in the API contract.
     return _fmt(
-        data, "positions", "virtualPositions",
-        drop=("averagePositionPricePt", "quantityLots", "positionUid"),
+        data, "positions", "virtualPositions", drop=("averagePositionPricePt", "quantityLots"),
     )
 
 
@@ -587,14 +590,15 @@ async def get_positions(account_id: str) -> str:
     """Get all positions in an account: securities, futures, options, and cash balances.
 
     Unlike get_portfolio, this returns raw position balances without price calculations.
-    A field that is zero or false (blocked, exchangeBlocked) is left out, and so is
-    positionUid; instrumentUid identifies the instrument.
+    A field that is zero or false (blocked, exchangeBlocked) is left out. balance is a
+    string holding an integer; positionUid is the key of the position, the same one the
+    portfolio and the operations carry.
 
     Args:
         account_id: Account ID (get from get_accounts)
     """
     data = await _call("OperationsService", "GetPositions", {"accountId": account_id})
-    return _fmt(data, "securities", "futures", "options", drop=("positionUid",))
+    return _fmt(data, "securities", "futures", "options")
 
 
 @read_only_tool
@@ -611,11 +615,13 @@ async def get_withdraw_limits(account_id: str) -> str:
 # ── Operations ───────────────────────────────────────────────────────────────
 
 # Fields of an operation that say again what another field or the request already says:
-# the operation type and the instrument under a second name, the account that was asked
-# for, a per-item cursor next to the page's nextCursor. A third of every item.
-_OPERATION_REPEATS = (
-    "operationType", "instrumentKind", "positionUid", "assetUid", "brokerAccountId", "cursor",
-)
+# instrumentKind is instrumentType under its enum name, assetUid follows from instrumentUid,
+# brokerAccountId is the account that was asked for, and the per-item cursor stands next to
+# the page's nextCursor. Checked on eight years of two real accounts. positionUid is not
+# such a field: it is the key of a position, shared by the listings of one paper. Neither
+# is operationType: in GetOperations `type` is a description in Russian and operationType
+# the only code.
+_OPERATION_REPEATS = ("instrumentKind", "assetUid", "brokerAccountId", "cursor")
 
 
 @read_only_tool
@@ -629,9 +635,16 @@ async def get_operations(
     """Get list of operations (transactions) for an account within a date range.
 
     Returns: buys, sells, dividends, coupons, taxes, commissions, deposits, withdrawals, etc.
-    Each operation has: id, type, date, payment amount, instrument info, quantity, trades.
-    A field that is zero or empty is left out, and so are fields that repeat another one
-    (operationType repeats type; positionUid and assetUid name what instrumentUid names).
+    Each operation has: id, operationType (the code, e.g. OPERATION_TYPE_BUY), type (the
+    same in Russian words), date, state, payment, price, quantity, quantityRest, figi,
+    instrumentUid, positionUid, trades. A field that is zero or empty is left out; assetUid
+    is left out too.
+
+    Canceled orders are operations as well, and carry the quantity and the payment they
+    asked for: pass state="EXECUTED" before adding up money or quantities. quantity is what
+    the order asked for and quantityRest what was not executed, so the executed quantity is
+    their difference. A bond repayment has no quantity. Prices and quantities are as they
+    were at the time: unlike candles, they are not adjusted for later splits.
 
     Note: this method has no paging and an active account has hundreds of operations a
     year — keep the range to a month or two, or use get_operations_by_cursor.
@@ -671,13 +684,23 @@ async def get_operations_by_cursor(
     """Get operations with cursor-based pagination. Better for large histories.
 
     Returns hasNext and nextCursor for pagination: pass nextCursor as cursor to get the
-    next page. Each operation item includes detailed info: payment, price, commission,
-    yield, quantity, trades, ticker. A field that is zero or empty is left out, and so are
-    fields that repeat another one or the request (instrumentKind, positionUid, assetUid,
-    brokerAccountId, the per-item cursor).
+    next page. Each operation item includes detailed info: id, type (the code, e.g.
+    OPERATION_TYPE_BUY), state, payment, price, commission, yield, quantity, quantityDone,
+    quantityRest, ticker, figi, instrumentUid, positionUid, trades. A field that is zero or
+    empty is left out, and so are fields that repeat another one or the request
+    (instrumentKind, assetUid, brokerAccountId, the per-item cursor).
+
+    Canceled orders are operations as well, and carry the quantity and the payment they
+    asked for: pass state="EXECUTED" before adding up money or quantities. quantity is what
+    the order asked for, quantityDone what was executed (left out when nothing was) and
+    quantityRest what was not — an order can be executed in part. A bond repayment has no
+    quantity. Prices and quantities are as they were at the time: unlike candles, they are
+    not adjusted for later splits. positionUid is the key of a position: one paper can come
+    under several figi and instrumentUid.
 
     Common operation types: BUY, SELL, DIVIDEND, COUPON, TAX, BOND_TAX, INPUT, OUTPUT,
-    BROKER_FEE, BOND_REPAYMENT_FULL, BOND_REPAYMENT.
+    BROKER_FEE, BOND_REPAYMENT_FULL, BOND_REPAYMENT; DIV_EXT is a dividend paid out to a
+    card, which never reaches the account.
 
     Args:
         account_id: Account ID
@@ -685,7 +708,7 @@ async def get_operations_by_cursor(
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         cursor: Cursor from previous response for pagination
         limit: Number of operations per page (1-1000, default: 50; a page of 50 is about
-            25,000 characters, and a client refuses a result several times that)
+            28,000 characters, and a client refuses a result twice that)
         instrument_id: Filter by instrument — ticker, FIGI, ISIN or UID
         operation_types: Comma-separated operation types (e.g. "BUY,SELL,DIVIDEND")
         state: Filter by state: EXECUTED, CANCELED, PROGRESS
@@ -1300,7 +1323,9 @@ async def get_candles(
     "columns". Volumes are in lots; the two columns splitting volume into buys and sells are
     there when the API has them. For day, week and month candles "time" is a date.
     "last_candle_complete": false appears when the last candle's period is still running —
-    its close is the current price, not a close.
+    its close is the current price, not a close. Candles from before a split or a
+    consolidation usually come recalculated to today's shares, while operations keep the
+    prices and quantities of their day.
 
     The API limits the period one request may span: a day for minute candles, a week for
     5-10 minute ones, 3 weeks for 15-30 minute ones, 3 months for hourly ones, 6 years for
