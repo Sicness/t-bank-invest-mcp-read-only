@@ -12,11 +12,6 @@ import tbank_invest_mcp
 import tbank_invest_mcp.server as srv
 
 
-@pytest.fixture(autouse=True)
-def set_token(monkeypatch):
-    monkeypatch.setenv("TBANK_INVEST_TOKEN", "test-token")
-
-
 @pytest.fixture
 async def tools():
     return await srv.mcp.list_tools()

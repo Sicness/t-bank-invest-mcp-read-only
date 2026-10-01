@@ -10,11 +10,6 @@ from tbank_invest_mcp.server import BASE_URL, SERVICE_PREFIX, _call
 
 
 @pytest.fixture(autouse=True)
-def set_token(monkeypatch):
-    monkeypatch.setenv("TBANK_INVEST_TOKEN", "test-token")
-
-
-@pytest.fixture(autouse=True)
 def reset_client():
     """_call() reuses one module-level client; drop it so each test gets its mock."""
     server._client = None

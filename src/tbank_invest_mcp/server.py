@@ -80,18 +80,39 @@ def _choices(*values: str) -> Any:
     return Annotated[str, Field(json_schema_extra={"enum": list(values)})]
 
 
-InstrumentIdType = _choices(
-    "INSTRUMENT_ID_TYPE_FIGI", "INSTRUMENT_ID_TYPE_TICKER", "INSTRUMENT_ID_TYPE_UID",
-    "INSTRUMENT_ID_TYPE_POSITION_UID",
+# Enum values a tool checks itself, by their short names: the API silently ignores a filter
+# value it does not know. The schema types below are built from the same tuples.
+INSTRUMENT_ID_TYPES = ("FIGI", "TICKER", "UID", "POSITION_UID")
+INSTRUMENT_KINDS = (
+    "SHARE", "BOND", "ETF", "CURRENCY", "FUTURES", "OPTION", "SP", "CLEARING_CERTIFICATE",
+    "INDEX", "COMMODITY",
 )
+PORTFOLIO_CURRENCIES = {"RUB": 0, "USD": 1, "EUR": 2}  # GetPortfolio takes the number
+OPERATION_STATES = ("EXECUTED", "CANCELED", "PROGRESS")
+BOND_EVENT_TYPES = ("CPN", "CALL", "MTY", "CONV")
+# GetTechAnalysis names the same intervals differently from GetCandles.
+INDICATOR_INTERVALS = {
+    "CANDLE_INTERVAL_1_MIN": "INDICATOR_INTERVAL_ONE_MINUTE",
+    "CANDLE_INTERVAL_2_MIN": "INDICATOR_INTERVAL_2_MIN",
+    "CANDLE_INTERVAL_3_MIN": "INDICATOR_INTERVAL_3_MIN",
+    "CANDLE_INTERVAL_5_MIN": "INDICATOR_INTERVAL_FIVE_MINUTES",
+    "CANDLE_INTERVAL_10_MIN": "INDICATOR_INTERVAL_10_MIN",
+    "CANDLE_INTERVAL_15_MIN": "INDICATOR_INTERVAL_FIFTEEN_MINUTES",
+    "CANDLE_INTERVAL_30_MIN": "INDICATOR_INTERVAL_30_MIN",
+    "CANDLE_INTERVAL_HOUR": "INDICATOR_INTERVAL_ONE_HOUR",
+    "CANDLE_INTERVAL_2_HOUR": "INDICATOR_INTERVAL_2_HOUR",
+    "CANDLE_INTERVAL_4_HOUR": "INDICATOR_INTERVAL_4_HOUR",
+    "CANDLE_INTERVAL_DAY": "INDICATOR_INTERVAL_ONE_DAY",
+    "CANDLE_INTERVAL_WEEK": "INDICATOR_INTERVAL_WEEK",
+    "CANDLE_INTERVAL_MONTH": "INDICATOR_INTERVAL_MONTH",
+}
+
+InstrumentIdType = _choices(*("INSTRUMENT_ID_TYPE_" + t for t in INSTRUMENT_ID_TYPES))
 InstrumentStatus = _choices("INSTRUMENT_STATUS_BASE", "INSTRUMENT_STATUS_ALL")
-InstrumentKind = _choices(
-    "", "share", "bond", "etf", "currency", "futures", "option", "sp",
-    "clearing_certificate", "index", "commodity",
-)
-PortfolioCurrency = _choices("RUB", "USD", "EUR")
-OperationState = _choices("", "EXECUTED", "CANCELED", "PROGRESS")
-BondEventType = _choices("", "CPN", "CALL", "MTY", "CONV")
+InstrumentKind = _choices("", *(k.lower() for k in INSTRUMENT_KINDS))
+PortfolioCurrency = _choices(*PORTFOLIO_CURRENCIES)
+OperationState = _choices("", *OPERATION_STATES)
+BondEventType = _choices("", *BOND_EVENT_TYPES)
 CandleInterval = _choices(
     "CANDLE_INTERVAL_5_SEC", "CANDLE_INTERVAL_10_SEC", "CANDLE_INTERVAL_30_SEC",
     "CANDLE_INTERVAL_1_MIN", "CANDLE_INTERVAL_2_MIN", "CANDLE_INTERVAL_3_MIN",
@@ -104,13 +125,7 @@ IndicatorType = _choices(
     "INDICATOR_TYPE_SMA", "INDICATOR_TYPE_EMA", "INDICATOR_TYPE_RSI", "INDICATOR_TYPE_MACD",
     "INDICATOR_TYPE_BB",
 )
-IndicatorInterval = _choices(
-    "INDICATOR_INTERVAL_ONE_MINUTE", "INDICATOR_INTERVAL_2_MIN", "INDICATOR_INTERVAL_3_MIN",
-    "INDICATOR_INTERVAL_FIVE_MINUTES", "INDICATOR_INTERVAL_10_MIN",
-    "INDICATOR_INTERVAL_FIFTEEN_MINUTES", "INDICATOR_INTERVAL_30_MIN",
-    "INDICATOR_INTERVAL_ONE_HOUR", "INDICATOR_INTERVAL_2_HOUR", "INDICATOR_INTERVAL_4_HOUR",
-    "INDICATOR_INTERVAL_ONE_DAY", "INDICATOR_INTERVAL_WEEK", "INDICATOR_INTERVAL_MONTH",
-)
+IndicatorInterval = _choices(*INDICATOR_INTERVALS.values())
 TypeOfPrice = _choices(
     "TYPE_OF_PRICE_CLOSE", "TYPE_OF_PRICE_OPEN", "TYPE_OF_PRICE_HIGH", "TYPE_OF_PRICE_LOW",
     "TYPE_OF_PRICE_AVG",
@@ -249,6 +264,16 @@ def _parse_date(
     raise ValueError(f"Cannot parse date: {s!r}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format.")
 
 
+def _period(from_date: str, to_date: str, *, back: int = 0, ahead: int = 0) -> dict[str, str]:
+    """The "from" and "to" of a request: the dates given, or by default from `back` days ago
+    to `ahead` days from now. A to_date without a time includes that whole day."""
+    now = datetime.now(timezone.utc)
+    return {
+        "from": _ts(_parse_date(from_date, now - timedelta(days=back))),
+        "to": _ts(_parse_date(to_date, now + timedelta(days=ahead), end_of_day=True)),
+    }
+
+
 def _enum(value: str, prefix: str, allowed: tuple[str, ...] = ()) -> str:
     """Full enum name for the API from a value given with or without its prefix, in any case.
 
@@ -265,6 +290,11 @@ def _number(q: dict[str, Any]) -> int | float:
     """A Quotation or MoneyValue ({units, nano}) as a number; an int when it is whole."""
     units, nano = int(q.get("units", 0)), int(q.get("nano", 0))
     return units if nano == 0 else round(units + nano / 1_000_000_000, 9)
+
+
+def _number_at(obj: dict, key: str) -> int | float | None:
+    """The Quotation obj[key] as a number; None when it is missing or empty."""
+    return _number(obj[key]) if obj.get(key) else None
 
 
 def _is_quotation(value: Any) -> bool:
@@ -318,9 +348,8 @@ def _is_empty(value: Any) -> bool:
     return value is None or value is False or value in (0, "0", "") or value == [] or value == {}
 
 
-def _trimmed(data: dict, *list_keys: str, drop: tuple[str, ...] = ()) -> dict:
+def _trimmed(data: Any, *list_keys: str, drop: tuple[str, ...] = ()) -> Any:
     """_plain(data) whose items in the named lists have lost their zero, false and empty fields.
-    Already plain: dump it with _json, not _fmt.
 
     Positions, operations and bond events are long lists of wide objects in which most
     fields say "nothing here"; leaving those out is what makes such a response fit into a
@@ -337,14 +366,11 @@ def _trimmed(data: dict, *list_keys: str, drop: tuple[str, ...] = ()) -> dict:
     return out
 
 
-def _json(data: Any) -> str:
+def _fmt(data: Any, *list_keys: str, drop: tuple[str, ...] = ()) -> str:
+    """What a tool returns: the response made plain, as compact JSON. With list_keys (and
+    drop), the items of those lists are trimmed as well — see _trimmed."""
     # Compact: the reader is a model, and indentation is a third or more of a response.
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-
-def _fmt(data: Any) -> str:
-    """What a tool returns: the response made plain, as compact JSON."""
-    return _json(_plain(data))
+    return json.dumps(_trimmed(data, *list_keys, drop=drop), ensure_ascii=False, separators=(",", ":"))
 
 
 def _to_quotation(value: float) -> dict[str, Any]:
@@ -359,11 +385,6 @@ _UID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE
 # Bloomberg FIGIs and the ones T-Bank assigns itself. Other 12-character identifiers — ISINs,
 # bond tickers — are not FIGIs and do need a lookup.
 _FIGI_RE = re.compile(r"(BBG|TCS)[0-9A-Z]{9}")
-
-INSTRUMENT_KINDS = (
-    "SHARE", "BOND", "ETF", "CURRENCY", "FUTURES", "OPTION", "SP", "CLEARING_CERTIFICATE",
-    "INDEX", "COMMODITY",
-)
 
 # (identifier, kind, any_listing) → the instrument it names. Kept for the life of the
 # process: an identifier does not change what it names.
@@ -485,6 +506,11 @@ async def _uid(
     return identifier
 
 
+def _csv(values: str) -> list[str]:
+    """The items of a comma-separated parameter, stripped, empty ones left out."""
+    return [v.strip() for v in values.split(",") if v.strip()]
+
+
 async def _each(identifiers: list[str], resolve: Callable[[str], Any]) -> list[str]:
     """resolve() for every identifier of a list: each distinct one once, a few at a time."""
     distinct = list(dict.fromkeys(identifiers))
@@ -543,18 +569,17 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
         account_id: Account ID (get from get_accounts)
         currency: Portfolio currency — RUB, USD, or EUR (default: RUB)
     """
-    currency_map = {"RUB": 0, "USD": 1, "EUR": 2}
     code = currency.strip().upper()
-    if code not in currency_map:
-        raise ValueError(f"currency must be one of {', '.join(currency_map)}, got {currency!r}")
-    body: dict[str, Any] = {"accountId": account_id, "currency": currency_map[code]}
+    if code not in PORTFOLIO_CURRENCIES:
+        raise ValueError(f"currency must be one of {', '.join(PORTFOLIO_CURRENCIES)}, got {currency!r}")
+    body: dict[str, Any] = {"accountId": account_id, "currency": PORTFOLIO_CURRENCIES[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
     # averagePositionPricePt and quantityLots are deprecated in the API contract. positionUid
     # is a second identifier of what instrumentUid already names, and a seventh of the size.
-    return _json(_trimmed(
+    return _fmt(
         data, "positions", "virtualPositions",
         drop=("averagePositionPricePt", "quantityLots", "positionUid"),
-    ))
+    )
 
 
 @read_only_tool
@@ -569,7 +594,7 @@ async def get_positions(account_id: str) -> str:
         account_id: Account ID (get from get_accounts)
     """
     data = await _call("OperationsService", "GetPositions", {"accountId": account_id})
-    return _json(_trimmed(data, "securities", "futures", "options", drop=("positionUid",)))
+    return _fmt(data, "securities", "futures", "options", drop=("positionUid",))
 
 
 @read_only_tool
@@ -585,7 +610,6 @@ async def get_withdraw_limits(account_id: str) -> str:
 
 # ── Operations ───────────────────────────────────────────────────────────────
 
-OPERATION_STATES = ("EXECUTED", "CANCELED", "PROGRESS")
 # Fields of an operation that say again what another field or the request already says:
 # the operation type and the instrument under a second name, the account that was asked
 # for, a per-item cursor next to the page's nextCursor. A third of every item.
@@ -619,14 +643,7 @@ async def get_operations(
         state: Filter by state: EXECUTED, CANCELED, PROGRESS (empty = all)
         figi: Filter by instrument — FIGI, ticker, ISIN or UID (empty = all instruments)
     """
-    now = datetime.now(timezone.utc)
-    dt_from = _parse_date(from_date, now - timedelta(days=30))
-    dt_to = _parse_date(to_date, now, end_of_day=True)
-    body: dict[str, Any] = {
-        "accountId": account_id,
-        "from": _ts(dt_from),
-        "to": _ts(dt_to),
-    }
+    body: dict[str, Any] = {"accountId": account_id, **_period(from_date, to_date, back=30)}
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     if figi:
@@ -635,7 +652,7 @@ async def get_operations(
         instrument = None if _FIGI_RE.fullmatch(figi) else await _find_exact(figi)
         body["figi"] = (instrument or {}).get("figi") or figi
     data = await _call("OperationsService", "GetOperations", body)
-    return _json(_trimmed(data, "operations", drop=_OPERATION_REPEATS))
+    return _fmt(data, "operations", drop=_OPERATION_REPEATS)
 
 
 @read_only_tool
@@ -675,13 +692,9 @@ async def get_operations_by_cursor(
         without_commissions: Exclude commission operations
         without_trades: Exclude trade details from response
     """
-    now = datetime.now(timezone.utc)
-    dt_from = _parse_date(from_date, now - timedelta(days=365))
-    dt_to = _parse_date(to_date, now, end_of_day=True)
     body: dict[str, Any] = {
         "accountId": account_id,
-        "from": _ts(dt_from),
-        "to": _ts(dt_to),
+        **_period(from_date, to_date, back=365),
         "limit": min(max(limit, 1), 1000),
         "withoutCommissions": without_commissions,
         "withoutTrades": without_trades,
@@ -691,13 +704,11 @@ async def get_operations_by_cursor(
     if instrument_id:
         body["instrumentId"] = await _uid(instrument_id)
     if operation_types:
-        body["operationTypes"] = [
-            _enum(t, "OPERATION_TYPE_") for t in operation_types.split(",") if t.strip()
-        ]
+        body["operationTypes"] = [_enum(t, "OPERATION_TYPE_") for t in _csv(operation_types)]
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
-    return _json(_trimmed(data, "items", drop=_OPERATION_REPEATS))
+    return _fmt(data, "items", drop=_OPERATION_REPEATS)
 
 
 # ── Instruments ──────────────────────────────────────────────────────────────
@@ -772,7 +783,7 @@ async def _instrument_ref(id: str, id_type: str, class_code: str, kind: str = ""
     by its shape and anything else is looked up; id_type and class_code still work as before.
     """
     id = id.strip()
-    id_type = _enum(id_type or "FIGI", "INSTRUMENT_ID_TYPE_", ("FIGI", "TICKER", "UID", "POSITION_UID"))
+    id_type = _enum(id_type or "FIGI", "INSTRUMENT_ID_TYPE_", INSTRUMENT_ID_TYPES)
     if class_code:
         # A class code only goes with a ticker, whatever id_type was left at.
         if id_type == "INSTRUMENT_ID_TYPE_FIGI":
@@ -845,11 +856,7 @@ async def get_bond_coupons(
     # a call with neither fails with "Missing parameter: figi", which points at the wrong one.
     if not (instrument_id or figi):
         raise ValueError("instrument_id is required: the bond's ticker, FIGI, ISIN or UID")
-    now = datetime.now(timezone.utc)
-    body: dict[str, Any] = {
-        "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
-    }
+    body: dict[str, Any] = _period(from_date, to_date, ahead=365)
     if instrument_id:
         body["instrumentId"] = await _uid(instrument_id, "bond", any_listing=True)
     if figi:
@@ -858,7 +865,6 @@ async def get_bond_coupons(
     return _fmt(data)
 
 
-BOND_EVENT_TYPES = ("CPN", "CALL", "MTY", "CONV")
 # Names this tool's description used to give. The API never knew them and ignored the filter.
 BOND_EVENT_ALIASES = {"COUPON": "CPN", "MATURITY": "MTY", "CONVERSION": "CONV"}
 
@@ -894,7 +900,7 @@ async def get_bond_events(
     if to_date:
         body["to"] = _ts(_parse_date(to_date, end_of_day=True))
     data = await _call("InstrumentsService", "GetBondEvents", body)
-    return _json(_trimmed(data, "events"))
+    return _fmt(data, "events")
 
 
 @read_only_tool
@@ -984,11 +990,9 @@ async def get_dividends(
         from_date: Start date (YYYY-MM-DD), default: 2 years ago
         to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
-    now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetDividends", {
         "instrumentId": await _uid(instrument_id, any_listing=True),
-        "from": _ts(_parse_date(from_date, now - timedelta(days=730))),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
+        **_period(from_date, to_date, back=730, ahead=365),
     })
     return _fmt(data)
 
@@ -1006,11 +1010,9 @@ async def get_accrued_interests(
         from_date: Start date (YYYY-MM-DD), default: 30 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
     """
-    now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAccruedInterests", {
         "instrumentId": await _uid(instrument_id, "bond", any_listing=True),
-        "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
-        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
+        **_period(from_date, to_date, back=30),
     })
     return _fmt(data)
 
@@ -1025,8 +1027,7 @@ async def get_asset_fundamentals(assets: str) -> str:
     Args:
         assets: Comma-separated list of tickers, FIGIs, ISINs, instrument UIDs or asset UIDs
     """
-    given = [a.strip() for a in assets.split(",") if a.strip()]
-    asset_list = await _each(given, _asset_uid_for)
+    asset_list = await _each(_csv(assets), _asset_uid_for)
     data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": asset_list})
     return _fmt(data)
 
@@ -1168,11 +1169,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     if candle_days < 1:
         raise ValueError(f"candle_days must be at least 1, got {candle_days}")
 
-    found = await _call("InstrumentsService", "FindInstrument", {
-        "query": ticker,
-        "instrumentKind": "INSTRUMENT_TYPE_SHARE",
-    })
-    hits = found.get("instruments", [])
+    hits = await _search(ticker, "share", tradable_only=False)
     rivals = _exact([i for i in hits if i.get("apiTradeAvailableFlag")], ticker.strip(), class_code)
     if len({i.get("isin") for i in rivals}) > 1:
         names = ", ".join(f"{i.get('ticker')} on {i.get('classCode')} ({i.get('name')})" for i in rivals[:8])
@@ -1212,12 +1209,9 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     # The change is measured from the close before the first of the last candle_days sessions.
     candles = finished[-(candle_days + 1):]
     price: dict[str, Any] = {}
-    def close(candle: dict) -> int | float | None:
-        return _number(candle["close"]) if candle.get("close") else None
-
     if candles:
-        base_close = close(candles[0])
-        last_close = close(candles[-1])
+        base_close = _number_at(candles[0], "close")
+        last_close = _number_at(candles[-1], "close")
         price["last_close"] = last_close
         if candles[-1].get("time"):
             price["last_close_date"] = candles[-1]["time"][:10]
@@ -1225,7 +1219,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
             price["change_pct"] = round((last_close - base_close) / base_close * 100, 2)
             price["change_sessions"] = len(candles) - 1
     if all_candles and not all_candles[-1].get("isComplete", True):
-        price["current_price"] = close(all_candles[-1])
+        price["current_price"] = _number_at(all_candles[-1], "close")
 
     return _fmt({
         "ticker": instrument.get("ticker"),
@@ -1267,11 +1261,9 @@ async def get_asset_reports(
         from_date: Start date (YYYY-MM-DD), default: now
         to_date: End date (YYYY-MM-DD, inclusive), default: 1 year ahead
     """
-    now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAssetReports", {
         "instrumentId": await _uid(instrument_id, figi_ok=False, any_listing=True),
-        "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
+        **_period(from_date, to_date, ahead=365),
     })
     return _fmt(data)
 
@@ -1296,11 +1288,7 @@ async def get_trading_schedules(
         from_date: Start date (YYYY-MM-DD), default: today
         to_date: End date (YYYY-MM-DD, inclusive), default: 7 days ahead
     """
-    now = datetime.now(timezone.utc)
-    body: dict[str, Any] = {
-        "from": _ts(_parse_date(from_date, now)),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=7), end_of_day=True)),
-    }
+    body: dict[str, Any] = _period(from_date, to_date, ahead=7)
     if exchange:
         body["exchange"] = exchange
     data = await _call("InstrumentsService", "TradingSchedules", body)
@@ -1339,19 +1327,14 @@ async def get_candles(
                   CANDLE_INTERVAL_WEEK, CANDLE_INTERVAL_MONTH (also 5/10/30_SEC,
                   2/3/10/30_MIN, 2/4_HOUR)
     """
-    now = datetime.now(timezone.utc)
     interval = _enum(interval, "CANDLE_INTERVAL_")
     data = await _call("MarketDataService", "GetCandles", {
         "instrumentId": await _uid(instrument_id),
-        "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
-        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
+        **_period(from_date, to_date, back=30),
         "interval": interval,
     })
     candles = data.get("candles", [])
     dates_only = interval in ("CANDLE_INTERVAL_DAY", "CANDLE_INTERVAL_WEEK", "CANDLE_INTERVAL_MONTH")
-
-    def price(candle: dict, key: str) -> int | float | None:
-        return _number(candle[key]) if candle.get(key) else None
 
     def lots(candle: dict, key: str) -> int | None:
         return int(candle[key]) if candle.get(key) is not None else None
@@ -1363,7 +1346,7 @@ async def get_candles(
         "candles": [
             [
                 c.get("time", "")[:10] if dates_only else c.get("time", ""),
-                price(c, "open"), price(c, "high"), price(c, "low"), price(c, "close"),
+                *(_number_at(c, k) for k in ("open", "high", "low", "close")),
                 int(c.get("volume") or 0),
                 *(lots(c, k) for k in sides),
             ]
@@ -1377,8 +1360,7 @@ async def get_candles(
 
 async def _uids(instrument_ids: str) -> list[str]:
     """Instrument UIDs for a comma-separated list of tickers, FIGIs, ISINs or UIDs."""
-    given = [i.strip() for i in instrument_ids.split(",") if i.strip()]
-    return await _each(given, _uid)
+    return await _each(_csv(instrument_ids), _uid)
 
 
 @read_only_tool
@@ -1431,23 +1413,6 @@ async def get_trading_status(instrument_id: str) -> str:
     return _fmt(data)
 
 
-# GetTechAnalysis names the same intervals differently from GetCandles.
-INDICATOR_INTERVALS = {
-    "CANDLE_INTERVAL_1_MIN": "INDICATOR_INTERVAL_ONE_MINUTE",
-    "CANDLE_INTERVAL_2_MIN": "INDICATOR_INTERVAL_2_MIN",
-    "CANDLE_INTERVAL_3_MIN": "INDICATOR_INTERVAL_3_MIN",
-    "CANDLE_INTERVAL_5_MIN": "INDICATOR_INTERVAL_FIVE_MINUTES",
-    "CANDLE_INTERVAL_10_MIN": "INDICATOR_INTERVAL_10_MIN",
-    "CANDLE_INTERVAL_15_MIN": "INDICATOR_INTERVAL_FIFTEEN_MINUTES",
-    "CANDLE_INTERVAL_30_MIN": "INDICATOR_INTERVAL_30_MIN",
-    "CANDLE_INTERVAL_HOUR": "INDICATOR_INTERVAL_ONE_HOUR",
-    "CANDLE_INTERVAL_2_HOUR": "INDICATOR_INTERVAL_2_HOUR",
-    "CANDLE_INTERVAL_4_HOUR": "INDICATOR_INTERVAL_4_HOUR",
-    "CANDLE_INTERVAL_DAY": "INDICATOR_INTERVAL_ONE_DAY",
-    "CANDLE_INTERVAL_WEEK": "INDICATOR_INTERVAL_WEEK",
-    "CANDLE_INTERVAL_MONTH": "INDICATOR_INTERVAL_MONTH",
-}
-
 
 @read_only_tool
 async def get_tech_analysis(
@@ -1485,7 +1450,6 @@ async def get_tech_analysis(
         slow_length: MACD only — period of the slow EMA (default: 26)
         signal_smoothing: MACD only — period of the signal line (default: 9)
     """
-    now = datetime.now(timezone.utc)
     indicator_type = _enum(indicator_type, "INDICATOR_TYPE_")
     candle_name = _enum(interval, "CANDLE_INTERVAL_")
     interval = INDICATOR_INTERVALS.get(candle_name) or _enum(interval, "INDICATOR_INTERVAL_")
@@ -1493,8 +1457,7 @@ async def get_tech_analysis(
     body: dict[str, Any] = {
         "instrumentUid": await _uid(instrument_id, figi_ok=False),
         "indicatorType": indicator_type,
-        "from": _ts(_parse_date(from_date, now - timedelta(days=90))),
-        "to": _ts(_parse_date(to_date, now, end_of_day=True)),
+        **_period(from_date, to_date, back=90),
         "interval": interval,
         "typeOfPrice": type_of_price,
         "length": length,

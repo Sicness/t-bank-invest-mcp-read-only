@@ -11,11 +11,6 @@ import tbank_invest_mcp.server as srv
 
 
 @pytest.fixture(autouse=True)
-def set_token(monkeypatch):
-    monkeypatch.setenv("TBANK_INVEST_TOKEN", "test-token")
-
-
-@pytest.fixture(autouse=True)
 def forget_resolved_instruments():
     """Identifier lookups are cached for the life of the process; tests must not share them."""
     for cache in (srv._resolved, srv._missed, srv._asset_uids):
@@ -718,13 +713,13 @@ class TestGetConsensusForecasts:
 
 def closes(*values):
     """Daily candles, oldest first, with the given close prices."""
-    return {"candles": [{"close": {"units": str(v), "nano": 0}} for v in values]}
+    return {"candles": [{"close": quotation(v)} for v in values]}
 
 
 def candle(close, day, complete=True):
     """A daily candle the way the API sends it: with its date and the isComplete flag."""
     return {
-        "close": {"units": str(close), "nano": 0},
+        "close": quotation(close),
         "time": f"{day}T00:00:00Z",
         "isComplete": complete,
     }
