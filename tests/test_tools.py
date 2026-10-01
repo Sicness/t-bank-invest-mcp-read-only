@@ -1739,7 +1739,7 @@ class TestPortfolioShaping:
 def raw_candle(time, o, h, l, c, volume, complete=True):
     return {"time": time, "open": quotation(o), "high": quotation(h), "low": quotation(l),
             "close": quotation(c, 500000000), "volume": str(volume), "isComplete": complete,
-            "candleSource": "CANDLE_SOURCE_EXCHANGE", "volumeBuy": "1", "volumeSell": "2"}
+            "candleSource": "CANDLE_SOURCE_EXCHANGE"}
 
 
 class TestCandleRows:
@@ -1752,6 +1752,17 @@ class TestCandleRows:
             "columns": ["time", "open", "high", "low", "close", "volume"],
             "candles": [["2026-09-29", 270, 275, 269, 273.5, 1000], ["2026-09-30", 273, 276, 272, 274.5, 2000]],
         }
+
+    async def test_buy_and_sell_volume_columns_when_the_api_has_them(self):
+        candle = {**raw_candle("2026-09-30T00:00:00Z", 273, 276, 272, 274, 2000), "volumeBuy": "1200", "volumeSell": "800"}
+        partial = raw_candle("2026-10-01T00:00:00Z", 274, 275, 273, 274, 500)
+        with patch.object(srv, "_call", make_call_mock({"candles": [candle, partial]})):
+            result = json.loads(await srv.get_candles(SBER["uid"]))
+        assert result["columns"] == ["time", "open", "high", "low", "close", "volume", "volumeBuy", "volumeSell"]
+        assert result["candles"] == [
+            ["2026-09-30", 273, 276, 272, 274.5, 2000, 1200, 800],
+            ["2026-10-01", 274, 275, 273, 274.5, 500, None, None],
+        ]
 
     async def test_intraday_candles_keep_the_time(self):
         data = {"candles": [raw_candle("2026-09-30T07:00:00Z", 270, 275, 269, 273, 1000)]}

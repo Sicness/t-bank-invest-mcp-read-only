@@ -1228,10 +1228,12 @@ async def get_candles(
 ) -> str:
     """Get historical candles (OHLCV) for an instrument.
 
-    Returns {"columns": ["time", "open", "high", "low", "close", "volume"], "candles": [...]}:
-    one row per candle, oldest first, in the order of "columns". Volume is in lots. For day,
-    week and month candles "time" is a date. "last_candle_complete": false appears when the
-    last candle's period is still running — its close is the current price, not a close.
+    Returns {"columns": ["time", "open", "high", "low", "close", "volume", "volumeBuy",
+    "volumeSell"], "candles": [...]}: one row per candle, oldest first, in the order of
+    "columns". Volumes are in lots; the two columns splitting volume into buys and sells are
+    there when the API has them. For day, week and month candles "time" is a date.
+    "last_candle_complete": false appears when the last candle's period is still running —
+    its close is the current price, not a close.
 
     The API limits the period one request may span: a day for minute candles, a week for
     5-10 minute ones, 3 weeks for 15-30 minute ones, 3 months for hourly ones, 6 years for
@@ -1260,13 +1262,19 @@ async def get_candles(
     def price(candle: dict, key: str) -> int | float | None:
         return _number(candle[key]) if candle.get(key) else None
 
+    def lots(candle: dict, key: str) -> int | None:
+        return int(candle[key]) if candle.get(key) is not None else None
+
+    # Buy and sell volume are not there for every instrument and period.
+    sides = [k for k in ("volumeBuy", "volumeSell") if any(k in c for c in candles)]
     result: dict[str, Any] = {
-        "columns": ["time", "open", "high", "low", "close", "volume"],
+        "columns": ["time", "open", "high", "low", "close", "volume", *sides],
         "candles": [
             [
                 c.get("time", "")[:10] if dates_only else c.get("time", ""),
                 price(c, "open"), price(c, "high"), price(c, "low"), price(c, "close"),
                 int(c.get("volume") or 0),
+                *(lots(c, k) for k in sides),
             ]
             for c in candles
         ],

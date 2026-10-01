@@ -145,7 +145,7 @@ uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-inv
 ### Рыночные данные
 | Инструмент | Описание |
 |---|---|
-| `get_candles` | Исторические свечи (OHLCV) строками `[время, open, high, low, close, объём]` |
+| `get_candles` | Исторические свечи (OHLCV) строками `[время, open, high, low, close, объём, покупки, продажи]` |
 | `get_last_prices` | Последние цены сделок |
 | `get_close_prices` | Цены закрытия предыдущей сессии |
 | `get_order_book` | Стакан заявок (bids/asks) |
