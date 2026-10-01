@@ -29,7 +29,7 @@ dependencies = [
 Homepage = "https://github.com/Sicness/t-bank-invest-mcp-read-only"
 Repository = "https://github.com/Sicness/t-bank-invest-mcp-read-only"
 Issues = "https://github.com/Sicness/t-bank-invest-mcp-read-only/issues"
-Changelog = "https://github.com/Sicness/t-bank-invest-mcp-read-only/releases"
+Changelog = "https://github.com/Sicness/t-bank-invest-mcp-read-only/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

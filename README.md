@@ -68,7 +68,7 @@ claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx t-bank
 
 ### Конкретная версия
 
-`uvx` берёт последнюю версию с PyPI и обновляется сам. Чтобы закрепить версию, укажите её после имени — `t-bank-invest-mcp-read-only@1.0.0`; список версий — на странице [релизов](https://github.com/Sicness/t-bank-invest-mcp-read-only/releases).
+`uvx` берёт последнюю версию с PyPI и обновляется сам. Чтобы закрепить версию, укажите её после имени — `t-bank-invest-mcp-read-only@1.0.0`; что менялось от версии к версии — в [истории изменений](https://github.com/Sicness/t-bank-invest-mcp-read-only/blob/main/CHANGELOG.md).
 
 Ещё не выпущенное состояние ветки `main`: `uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only`.
 

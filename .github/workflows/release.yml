@@ -52,6 +52,31 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The GitHub Release is described by this version's section of CHANGELOG.md.
+      # GitHub's generated notes list merged pull requests only, and most changes
+      # here are pushed straight to main. A pre-release takes the section of the
+      # version it leads to (1.0.0.dev1 -> 1.0.0).
+      - name: Take the release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          section() { awk -v v="$1" '/^## / { on = ($2 == v); next } on' CHANGELOG.md; }
+          section "$VERSION" > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            if [ "$PRERELEASE" = false ]; then
+              echo "::error::CHANGELOG.md has no section \"## $VERSION\". Describe the release there first."
+              exit 1
+            fi
+            section "$(echo "$VERSION" | sed -E 's/\.?(a|b|rc|dev)[0-9]+$//')" > release-notes.md
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
       - name: Build sdist and wheel
         run: |
           pip install build twine
@@ -98,6 +123,10 @@ jobs:
           name: dist
           path: dist/
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,6 +139,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
             --generate-notes \
             --verify-tag \
             "${prerelease[@]}"
