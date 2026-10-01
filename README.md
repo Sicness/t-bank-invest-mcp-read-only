@@ -1,6 +1,9 @@
 # T-Bank Invest MCP Server (read-only)
 
 [![Tests](https://github.com/Sicness/t-bank-invest-mcp-read-only/actions/workflows/tests.yml/badge.svg)](https://github.com/Sicness/t-bank-invest-mcp-read-only/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/t-bank-invest-mcp-read-only)](https://pypi.org/project/t-bank-invest-mcp-read-only/)
+
+<!-- mcp-name: io.github.Sicness/t-bank-invest-mcp-read-only -->
 
 MCP-сервер для работы с инвестиционным портфелем Т-Банка (Тинькофф) через AI-ассистентов. Предоставляет **только чтение** — сервер не может совершать сделки, выводить средства или изменять настройки счёта.
 
@@ -27,12 +30,12 @@ MCP-клиенты хранят токен в своей конфигураци�
 
 ## Подключение
 
-Клонировать репозиторий не нужно: `uvx` скачает и запустит сервер сам. Токен передаётся через переменную окружения `TBANK_INVEST_TOKEN` в конфигурации MCP-клиента.
+Сервер опубликован на [PyPI](https://pypi.org/project/t-bank-invest-mcp-read-only/): клонировать репозиторий не нужно, `uvx` скачает и запустит его сам. Токен передаётся через переменную окружения `TBANK_INVEST_TOKEN` в конфигурации MCP-клиента.
 
 ### Claude Code
 
 ```bash
-claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only
+claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx t-bank-invest-mcp-read-only
 ```
 
 По умолчанию сервер подключается только к текущему проекту; чтобы он был доступен во всех проектах, добавьте `--scope user`. С `--scope project` конфигурация вместе с токеном записывается в `.mcp.json` в корне проекта — не коммитьте этот файл.
@@ -46,11 +49,7 @@ claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx --from
   "mcpServers": {
     "t-bank-invest": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Sicness/t-bank-invest-mcp-read-only",
-        "t-bank-invest-mcp-read-only"
-      ],
+      "args": ["t-bank-invest-mcp-read-only"],
       "env": {
         "TBANK_INVEST_TOKEN": "your_token_here"
       }
@@ -65,13 +64,13 @@ claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx --from
 
 Сервер работает по stdio. В любом клиенте укажите ту же команду, те же аргументы и переменную окружения, что в примере для Claude Desktop.
 
+Сервер также есть в [реестре MCP-серверов](https://registry.modelcontextprotocol.io/) под именем `io.github.Sicness/t-bank-invest-mcp-read-only`.
+
 ### Конкретная версия
 
-Без уточнения ставится текущее состояние ветки `main`. Чтобы закрепить версию, допишите к адресу тег со страницы [релизов](https://github.com/Sicness/t-bank-invest-mcp-read-only/releases), например:
+`uvx` берёт последнюю версию с PyPI и обновляется сам. Чтобы закрепить версию, укажите её после имени — `t-bank-invest-mcp-read-only@1.0.0`; список версий — на странице [релизов](https://github.com/Sicness/t-bank-invest-mcp-read-only/releases).
 
-```
-git+https://github.com/Sicness/t-bank-invest-mcp-read-only@v1.0.0
-```
+Ещё не выпущенное состояние ветки `main`: `uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only`.
 
 ### Установка из исходников
 
@@ -93,7 +92,7 @@ pip install -e ".[test]"
 
 ```bash
 export TBANK_INVEST_TOKEN=your_token_here
-uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only
+uvx t-bank-invest-mcp-read-only
 ```
 
 Из установленного окружения то же самое делает команда `t-bank-invest-mcp-read-only` или `python -m tbank_invest_mcp`.
