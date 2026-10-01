@@ -1463,7 +1463,7 @@ class TestInstrumentResolution:
             await srv._uid("NEWCO")
             monkeypatch.setattr(srv, "MISS_TTL_SECONDS", 0)
             await srv._uid("NEWCO")
-        assert len(calls_to(mock, "FindInstrument")) == 4  # two searches each time
+        assert len(calls_to(mock, "FindInstrument")) == 2  # searched again the second time
 
     async def test_a_name_is_rejected_here_rather_than_sent_to_the_api(self):
         mock = route()
@@ -1521,7 +1521,7 @@ class TestInstrumentResolution:
             await srv.get_last_prices(",".join(tickers + tickers))
         assert peak <= srv.LOOKUP_BATCH
         assert len({b["query"] for b in calls_to(mock, "FindInstrument")}) == 30
-        assert len(calls_to(mock, "FindInstrument")) == 60  # tradable, then all, per distinct name
+        assert len(calls_to(mock, "FindInstrument")) == 60  # short names: tradable, then all, once each
         assert len(call_body(mock, "GetLastPrices")["instrumentId"]) == 60
 
     async def test_only_exact_matches_count(self):
@@ -1534,16 +1534,60 @@ class TestInstrumentResolution:
         mock = route(FindInstrument=search_results(SBER_OTC, SBER))
         with patch.object(srv, "_call", mock):
             assert await srv._uid("SBER") == SBER["uid"]
-        assert calls_to(mock, "FindInstrument") == [{"query": "SBER", "apiTradeAvailableFlag": True}]
+        # One search, and not limited to tradable listings: see the next tests for why.
+        assert calls_to(mock, "FindInstrument") == [{"query": "SBER"}]
 
     async def test_falls_back_to_non_tradable_listings(self):
         mock = route(FindInstrument=search_results(SBER_OTC))
         with patch.object(srv, "_call", mock):
             assert await srv._uid("SBER") == SBER_OTC["uid"]
-        assert calls_to(mock, "FindInstrument") == [
-            {"query": "SBER", "apiTradeAvailableFlag": True},
-            {"query": "SBER"},
-        ]
+
+    async def test_a_tradable_paper_does_not_hide_another_one_under_the_same_ticker(self):
+        # Real case: TECH is a foreign share tradable through the API and a Russian fund
+        # that is not. Looking among tradable listings alone found only the share, and a
+        # holder of the fund silently got the prices and dividends of another company.
+        share = {**SBER, "ticker": "TECH", "classCode": "SPBXM", "isin": "US09073M1045",
+                 "name": "Bio-Techne", "uid": "11111111-aaaa-bbbb-cccc-000000000001"}
+        fund = {**SBER_OTC, "ticker": "TECH", "classCode": "TQBR", "isin": "RU000A101X68",
+                "name": "Технологии Америки", "instrumentType": "etf",
+                "first1dayCandleDate": "2020-08-26T00:00:00Z",
+                "uid": "11111111-aaaa-bbbb-cccc-000000000002"}
+        fund_board = {**fund, "classCode": "TQTF", "uid": "11111111-aaaa-bbbb-cccc-000000000003"}
+        del fund_board["first1dayCandleDate"]
+        mock = route(FindInstrument=search_results(share, fund_board, fund))
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError) as exc_info:
+                await srv.get_dividends("TECH")
+            assert await srv._uid("TECH_TQBR") == fund["uid"]
+        message = str(exc_info.value)
+        assert "TECH_SPBXM" in message and "TECH_TQBR" in message
+        assert "TECH_TQTF" not in message  # one line per paper, not per board
+
+    async def test_a_dead_record_of_another_paper_is_not_an_ambiguity(self):
+        # Real case: ASTR also finds a delisted "Astra Space" on a technical board — not
+        # tradable, no candle history. It must not turn the live share into a question.
+        dead = {**SBER_OTC, "classCode": "FAKE_BEB", "isin": "US04634X2027", "name": "Astra Space",
+                "uid": "22222222-aaaa-bbbb-cccc-000000000001"}
+        mock = route(FindInstrument=search_results(dead, SBER))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER") == SBER["uid"]
+
+    async def test_a_short_generic_query_is_not_searched_in_full(self):
+        # "T" matches tens of thousands of listings: the full search is megabytes the API
+        # does not manage to send. Its tradable matches are all that can be had.
+        t_share = {**SBER, "ticker": "T"}
+        noise = [{**SBERP, "uid": f"{n:08d}-aaaa-bbbb-cccc-000000000000"} for n in range(srv.GENERIC_QUERY_HITS)]
+        mock = route(FindInstrument=search_results(t_share, *noise))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("T") == SBER["uid"]
+        assert calls_to(mock, "FindInstrument") == [{"query": "T", "apiTradeAvailableFlag": True}]
+
+    async def test_a_short_specific_query_is_searched_in_full_as_well(self):
+        x5 = {**SBER, "ticker": "X5"}
+        mock = route(FindInstrument=search_results(x5))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("X5") == SBER["uid"]
+        assert calls_to(mock, "FindInstrument") == [{"query": "X5", "apiTradeAvailableFlag": True}, {"query": "X5"}]
 
     async def test_several_matches_are_reported_not_guessed(self):
         other_board = {**SBER, "classCode": "SMAL", "uid": "99999999-2222-3333-4444-555555555555"}
@@ -1585,14 +1629,14 @@ class TestInstrumentResolution:
             await srv._uid("NOPE")
             await srv._uid("NOPE")
         queries = [b["query"] for b in calls_to(mock, "FindInstrument")]
-        assert queries == ["SBER", "NOPE", "NOPE"]  # one hit, then one tradable + one full miss
+        assert queries == ["SBER", "NOPE"]  # a hit and a miss, each asked about once
 
     async def test_kind_narrows_the_search(self):
         mock = route(FindInstrument=search_results(SBER))
         with patch.object(srv, "_call", mock):
             await srv._uid("SBER", "share")
         assert calls_to(mock, "FindInstrument")[0] == {
-            "query": "SBER", "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True,
+            "query": "SBER", "instrumentKind": "INSTRUMENT_TYPE_SHARE",
         }
 
     @pytest.mark.parametrize("call, method, key", [

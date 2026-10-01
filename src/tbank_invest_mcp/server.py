@@ -396,6 +396,12 @@ MISS_TTL_SECONDS = 600
 # How many identifiers of one list are looked up at a time; the API allows 200 requests a
 # minute per service, and a list can hold a whole portfolio.
 LOOKUP_BATCH = 8
+# A search not limited to listings tradable through the API returns everything the query is
+# a part of: a hundred kilobytes for SBER, megabytes for AA, and for a single letter more
+# than the API manages to send. An identifier of at least this length goes straight to that
+# search; a shorter one only if few tradable listings match it.
+FULL_SEARCH_MIN_LENGTH = 4
+GENERIC_QUERY_HITS = 100
 
 
 def _is_uid(identifier: str) -> bool:
@@ -424,17 +430,58 @@ def _exact(instruments: list[dict], identifier: str, class_code: str = "") -> li
     return list(found.values())
 
 
+def _is_live(instrument: dict) -> bool:
+    """Traded through the API, or with candle history: a paper someone can hold or look at.
+    The rest are technical boards and records of long delisted papers."""
+    return bool(instrument.get("apiTradeAvailableFlag") or instrument.get("first1dayCandleDate"))
+
+
+async def _named(query: str, kind: str, class_code: str) -> list[dict]:
+    """Every instrument that carries query as its ticker, FIGI, ISIN or UID.
+
+    The whole list, not only the listings tradable through the API: a ticker can name a
+    tradable paper and one that is not — a fund whose trading is suspended and a foreign
+    share with the same ticker — and the caller must see both to tell that it is ambiguous.
+    The exception is a short query too generic to ask for everything it matches.
+    """
+    if len(query) < FULL_SEARCH_MIN_LENGTH:
+        tradable = await _search(query, kind, tradable_only=True)
+        found = _exact(tradable, query, class_code)
+        if found and len(tradable) > GENERIC_QUERY_HITS:
+            return found
+    return _exact(await _search(query, kind, tradable_only=False), query, class_code)
+
+
+def _listing(listings: list[dict], any_listing: bool) -> list[dict]:
+    """The listing to use out of the listings of one paper; all of them if nothing decides.
+
+    One tradable through the API is preferred — for a share that leaves its main board out
+    of a dozen technical ones. Otherwise the API keeps candle history for one listing, the
+    board the paper really trades on. any_listing: see _find_exact.
+    """
+    tradable = [i for i in listings if i.get("apiTradeAvailableFlag")]
+    listings = tradable or listings
+    if len(listings) > 1:
+        with_history = [i for i in listings if i.get("first1dayCandleDate")]
+        if len(with_history) == 1 or (with_history and any_listing):
+            return with_history[:1]
+        if any_listing:
+            return listings[:1]
+    return listings
+
+
 async def _find_exact(identifier: str, kind: str = "", any_listing: bool = False) -> dict | None:
     """The instrument a ticker, FIGI, ISIN or TICKER_CLASSCODE names, or None if none does.
 
-    Listings tradable through the API are preferred — for a share that leaves its main
-    board out of a dozen technical ones. Raises ValueError when several instruments still
-    match, naming them, rather than picking one silently.
+    Raises ValueError when several instruments match, naming them, rather than picking one
+    silently. Different papers under one ticker are always that error, whether or not they
+    are tradable through the API; only records of dead papers do not count next to a live
+    one (see _is_live).
 
-    Several listings of one paper (one ISIN) are told apart by which of them has candle
-    history. If that does not single one out, any_listing decides: callers after something
-    the paper has whatever board it trades on — dividends, coupons, fundamentals — take the
-    first, the rest get the error. Different papers under one ticker are always an error.
+    Several listings of one paper (one ISIN) are not several instruments: _listing picks
+    one. If it cannot, any_listing decides: callers after something the paper has whatever
+    board it trades on — dividends, coupons, fundamentals — take the first, the rest get
+    the error.
     """
     identifier = identifier.strip()
     key = (identifier.upper(), kind.upper(), any_listing)
@@ -448,21 +495,15 @@ async def _find_exact(identifier: str, kind: str = "", any_listing: bool = False
         attempts.append(tuple(identifier.rsplit("_", 1)))
     hits: list[dict] = []
     for query, class_code in attempts:
-        for tradable_only in (True, False):
-            hits = _exact(await _search(query, kind, tradable_only), query, class_code)
-            if hits:
-                break
+        hits = await _named(query, kind, class_code)
         if hits:
             break
 
-    if len(hits) > 1 and len({i.get("isin") for i in hits}) == 1 and hits[0].get("isin"):
-        # Several listings of one paper. The API keeps candle history for one of them — the
-        # board the paper really trades on; the rest are negotiated-deal and technical boards.
-        with_history = [i for i in hits if i.get("first1dayCandleDate")]
-        if len(with_history) == 1 or (with_history and any_listing):
-            hits = with_history[:1]
-        elif any_listing:
-            hits = hits[:1]
+    hits = [i for i in hits if _is_live(i)] or hits
+    papers: dict[str, list[dict]] = {}
+    for i in hits:  # an instrument without an ISIN is a paper of its own
+        papers.setdefault(i.get("isin") or i.get("uid", ""), []).append(i)
+    hits = [i for listings in papers.values() for i in _listing(listings, any_listing)]
     if len(hits) > 1:
         names = ", ".join(
             f"{i.get('ticker')}_{i.get('classCode')} ({i.get('name')}, {i.get('instrumentType')})"
