@@ -1778,6 +1778,13 @@ class TestCandleRows:
             result = json.loads(await srv.get_candles(SBER["uid"]))
         assert result["candles"] == [["2026-09-30", None, None, None, None, 0]]
 
+    @pytest.mark.parametrize("given", ["DAY", "day", "CANDLE_INTERVAL_DAY"])
+    async def test_interval_prefix_is_optional(self, given):
+        mock = make_call_mock({"candles": []})
+        with patch.object(srv, "_call", mock):
+            await srv.get_candles(SBER["uid"], interval=given)
+        assert mock.call_args[0][2]["interval"] == "CANDLE_INTERVAL_DAY"
+
     async def test_a_year_of_candles_is_several_times_smaller(self):
         data = {"candles": [raw_candle(f"2026-01-{d % 28 + 1:02}T00:00:00Z", 270, 275, 269, 273, 874332) for d in range(250)]}
         with patch.object(srv, "_call", make_call_mock(data)):
@@ -1810,3 +1817,35 @@ class TestAssetFundamentalsIdentifiers:
         with patch.object(srv, "_call", mock):
             await srv.get_asset_fundamentals(asset_uid)
         assert call_body(mock, "GetAssetFundamentals") == {"assets": [asset_uid]}
+
+
+class TestTechAnalysisNames:
+    @pytest.mark.parametrize("given, sent", [
+        ("CANDLE_INTERVAL_DAY", "INDICATOR_INTERVAL_ONE_DAY"),
+        ("CANDLE_INTERVAL_HOUR", "INDICATOR_INTERVAL_ONE_HOUR"),
+        ("day", "INDICATOR_INTERVAL_ONE_DAY"),
+        ("ONE_DAY", "INDICATOR_INTERVAL_ONE_DAY"),
+        ("INDICATOR_INTERVAL_WEEK", "INDICATOR_INTERVAL_WEEK"),
+    ])
+    async def test_candle_interval_names_are_translated(self, given, sent):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis(SBER["uid"], "INDICATOR_TYPE_RSI", interval=given)
+        assert mock.call_args[0][2]["interval"] == sent
+
+    async def test_short_indicator_and_price_names(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_tech_analysis(SBER["uid"], "bb", type_of_price="open")
+        body = mock.call_args[0][2]
+        assert body["indicatorType"] == "INDICATOR_TYPE_BB"
+        assert body["typeOfPrice"] == "TYPE_OF_PRICE_OPEN"
+        assert "deviation" in body  # the BB-only field follows the normalised name
+
+
+class TestInstrumentListStatus:
+    async def test_short_status_name(self):
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.list_shares("all")
+        assert mock.call_args[0][2] == {"instrumentStatus": "INSTRUMENT_STATUS_ALL"}

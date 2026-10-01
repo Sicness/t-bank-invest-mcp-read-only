@@ -12,12 +12,13 @@ import ssl
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import certifi
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from tbank_invest_mcp import __version__
 
@@ -45,6 +46,7 @@ mcp = FastMCP(
         "An instrument parameter takes a ticker, FIGI, ISIN or UID; TICKER_CLASSCODE "
         "(SBER_TQBR) picks one listing when a ticker has several. Search by name with "
         "find_instrument. "
+        "Enum values may be given without their prefix (DAY for CANDLE_INTERVAL_DAY). "
         "Dates are UTC. A from_date/to_date given as YYYY-MM-DD covers whole days: "
         "to_date includes that day up to 23:59:59."
     ),
@@ -66,6 +68,52 @@ def read_only_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
         annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
         structured_output=False,
     )(fn)
+
+
+def _choices(*values: str) -> Any:
+    """Type of a string parameter whose JSON schema lists the values to pick from.
+
+    Only a hint for the client: nothing is validated against the list, so the short and
+    differently-cased spellings that _enum accepts keep working.
+    """
+    return Annotated[str, Field(json_schema_extra={"enum": list(values)})]
+
+
+InstrumentIdType = _choices(
+    "INSTRUMENT_ID_TYPE_FIGI", "INSTRUMENT_ID_TYPE_TICKER", "INSTRUMENT_ID_TYPE_UID",
+    "INSTRUMENT_ID_TYPE_POSITION_UID",
+)
+InstrumentStatus = _choices("INSTRUMENT_STATUS_BASE", "INSTRUMENT_STATUS_ALL")
+InstrumentKind = _choices(
+    "", "share", "bond", "etf", "currency", "futures", "option", "sp",
+    "clearing_certificate", "index", "commodity",
+)
+PortfolioCurrency = _choices("RUB", "USD", "EUR")
+OperationState = _choices("", "EXECUTED", "CANCELED", "PROGRESS")
+BondEventType = _choices("", "CPN", "CALL", "MTY", "CONV")
+CandleInterval = _choices(
+    "CANDLE_INTERVAL_5_SEC", "CANDLE_INTERVAL_10_SEC", "CANDLE_INTERVAL_30_SEC",
+    "CANDLE_INTERVAL_1_MIN", "CANDLE_INTERVAL_2_MIN", "CANDLE_INTERVAL_3_MIN",
+    "CANDLE_INTERVAL_5_MIN", "CANDLE_INTERVAL_10_MIN", "CANDLE_INTERVAL_15_MIN",
+    "CANDLE_INTERVAL_30_MIN", "CANDLE_INTERVAL_HOUR", "CANDLE_INTERVAL_2_HOUR",
+    "CANDLE_INTERVAL_4_HOUR", "CANDLE_INTERVAL_DAY", "CANDLE_INTERVAL_WEEK",
+    "CANDLE_INTERVAL_MONTH",
+)
+IndicatorType = _choices(
+    "INDICATOR_TYPE_SMA", "INDICATOR_TYPE_EMA", "INDICATOR_TYPE_RSI", "INDICATOR_TYPE_MACD",
+    "INDICATOR_TYPE_BB",
+)
+IndicatorInterval = _choices(
+    "INDICATOR_INTERVAL_ONE_MINUTE", "INDICATOR_INTERVAL_2_MIN", "INDICATOR_INTERVAL_3_MIN",
+    "INDICATOR_INTERVAL_FIVE_MINUTES", "INDICATOR_INTERVAL_10_MIN",
+    "INDICATOR_INTERVAL_FIFTEEN_MINUTES", "INDICATOR_INTERVAL_30_MIN",
+    "INDICATOR_INTERVAL_ONE_HOUR", "INDICATOR_INTERVAL_2_HOUR", "INDICATOR_INTERVAL_4_HOUR",
+    "INDICATOR_INTERVAL_ONE_DAY", "INDICATOR_INTERVAL_WEEK", "INDICATOR_INTERVAL_MONTH",
+)
+TypeOfPrice = _choices(
+    "TYPE_OF_PRICE_CLOSE", "TYPE_OF_PRICE_OPEN", "TYPE_OF_PRICE_HIGH", "TYPE_OF_PRICE_LOW",
+    "TYPE_OF_PRICE_AVG",
+)
 
 
 def _get_token() -> str:
@@ -433,7 +481,7 @@ async def get_margin_attributes(account_id: str) -> str:
 
 
 @read_only_tool
-async def get_portfolio(account_id: str, currency: str = "RUB") -> str:
+async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") -> str:
     """Get full portfolio for an account: total values by asset type, all positions with prices, yields, and quantities.
 
     Each position has ticker, classCode, figi, instrumentUid, instrumentType, quantity,
@@ -491,7 +539,7 @@ async def get_operations(
     account_id: str,
     from_date: str = "",
     to_date: str = "",
-    state: str = "",
+    state: OperationState = "",
     figi: str = "",
 ) -> str:
     """Get list of operations (transactions) for an account within a date range.
@@ -536,7 +584,7 @@ async def get_operations_by_cursor(
     limit: int = 100,
     instrument_id: str = "",
     operation_types: str = "",
-    state: str = "",
+    state: OperationState = "",
     without_commissions: bool = False,
     without_trades: bool = False,
 ) -> str:
@@ -595,7 +643,7 @@ _SEARCH_FIELDS = ("ticker", "classCode", "name", "instrumentType", "uid", "figi"
 @read_only_tool
 async def find_instrument(
     query: str,
-    instrument_kind: str = "",
+    instrument_kind: InstrumentKind = "",
     tradable_only: bool = True,
     limit: int = 20,
 ) -> str:
@@ -676,7 +724,7 @@ async def _instrument_ref(id: str, id_type: str, class_code: str, kind: str = ""
 @read_only_tool
 async def get_instrument_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed instrument info by its identifier.
@@ -696,7 +744,7 @@ async def get_instrument_by(
 @read_only_tool
 async def get_bond_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed bond info: maturity date, coupon rate, nominal, ACI, issue size, risk level.
@@ -751,7 +799,7 @@ BOND_EVENT_ALIASES = {"COUPON": "CPN", "MATURITY": "MTY", "CONVERSION": "CONV"}
 @read_only_tool
 async def get_bond_events(
     instrument_id: str,
-    type: str = "",
+    type: BondEventType = "",
     from_date: str = "",
     to_date: str = "",
 ) -> str:
@@ -785,7 +833,7 @@ async def get_bond_events(
 @read_only_tool
 async def get_share_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed share (stock) info: sector, dividend yield, IPO date, issue size, country.
@@ -803,7 +851,7 @@ async def get_share_by(
 @read_only_tool
 async def get_etf_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed ETF/fund info: management fee, tracking index, rebalance frequency.
@@ -821,7 +869,7 @@ async def get_etf_by(
 @read_only_tool
 async def get_currency_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed currency instrument info.
@@ -839,7 +887,7 @@ async def get_currency_by(
 @read_only_tool
 async def get_future_by(
     id: str,
-    id_type: str = "INSTRUMENT_ID_TYPE_FIGI",
+    id_type: InstrumentIdType = "INSTRUMENT_ID_TYPE_FIGI",
     class_code: str = "",
 ) -> str:
     """Get detailed futures contract info: expiration, basic asset, margin requirements.
@@ -1176,7 +1224,7 @@ async def get_candles(
     instrument_id: str,
     from_date: str = "",
     to_date: str = "",
-    interval: str = "CANDLE_INTERVAL_DAY",
+    interval: CandleInterval = "CANDLE_INTERVAL_DAY",
 ) -> str:
     """Get historical candles (OHLCV) for an instrument.
 
@@ -1199,6 +1247,7 @@ async def get_candles(
                   2/3/10/30_MIN, 2/4_HOUR)
     """
     now = datetime.now(timezone.utc)
+    interval = _enum(interval, "CANDLE_INTERVAL_")
     data = await _call("MarketDataService", "GetCandles", {
         "instrumentId": await _uid(instrument_id),
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
@@ -1283,14 +1332,32 @@ async def get_trading_status(instrument_id: str) -> str:
     return _fmt(data)
 
 
+# GetTechAnalysis names the same intervals differently from GetCandles.
+INDICATOR_INTERVALS = {
+    "CANDLE_INTERVAL_1_MIN": "INDICATOR_INTERVAL_ONE_MINUTE",
+    "CANDLE_INTERVAL_2_MIN": "INDICATOR_INTERVAL_2_MIN",
+    "CANDLE_INTERVAL_3_MIN": "INDICATOR_INTERVAL_3_MIN",
+    "CANDLE_INTERVAL_5_MIN": "INDICATOR_INTERVAL_FIVE_MINUTES",
+    "CANDLE_INTERVAL_10_MIN": "INDICATOR_INTERVAL_10_MIN",
+    "CANDLE_INTERVAL_15_MIN": "INDICATOR_INTERVAL_FIFTEEN_MINUTES",
+    "CANDLE_INTERVAL_30_MIN": "INDICATOR_INTERVAL_30_MIN",
+    "CANDLE_INTERVAL_HOUR": "INDICATOR_INTERVAL_ONE_HOUR",
+    "CANDLE_INTERVAL_2_HOUR": "INDICATOR_INTERVAL_2_HOUR",
+    "CANDLE_INTERVAL_4_HOUR": "INDICATOR_INTERVAL_4_HOUR",
+    "CANDLE_INTERVAL_DAY": "INDICATOR_INTERVAL_ONE_DAY",
+    "CANDLE_INTERVAL_WEEK": "INDICATOR_INTERVAL_WEEK",
+    "CANDLE_INTERVAL_MONTH": "INDICATOR_INTERVAL_MONTH",
+}
+
+
 @read_only_tool
 async def get_tech_analysis(
     instrument_id: str,
-    indicator_type: str,
+    indicator_type: IndicatorType,
     from_date: str = "",
     to_date: str = "",
-    interval: str = "INDICATOR_INTERVAL_ONE_DAY",
-    type_of_price: str = "TYPE_OF_PRICE_CLOSE",
+    interval: IndicatorInterval = "INDICATOR_INTERVAL_ONE_DAY",
+    type_of_price: TypeOfPrice = "TYPE_OF_PRICE_CLOSE",
     length: int = 14,
     deviation: float = 2.0,
     fast_length: int = 12,
@@ -1309,11 +1376,9 @@ async def get_tech_analysis(
                        INDICATOR_TYPE_MACD, INDICATOR_TYPE_BB
         from_date: Start date (YYYY-MM-DD), default: 90 days ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
-        interval: Not the get_candles names. INDICATOR_INTERVAL_ONE_MINUTE, INDICATOR_INTERVAL_2_MIN,
-                  INDICATOR_INTERVAL_3_MIN, INDICATOR_INTERVAL_FIVE_MINUTES, INDICATOR_INTERVAL_10_MIN,
-                  INDICATOR_INTERVAL_FIFTEEN_MINUTES, INDICATOR_INTERVAL_30_MIN, INDICATOR_INTERVAL_ONE_HOUR,
-                  INDICATOR_INTERVAL_2_HOUR, INDICATOR_INTERVAL_4_HOUR, INDICATOR_INTERVAL_ONE_DAY (default),
-                  INDICATOR_INTERVAL_WEEK, INDICATOR_INTERVAL_MONTH
+        interval: INDICATOR_INTERVAL_ONE_DAY (default), _ONE_HOUR, _WEEK, _MONTH and the minute
+                  and hour steps listed in the schema. The API names intervals differently
+                  here than in get_candles; a CANDLE_INTERVAL_* name is translated.
         type_of_price: TYPE_OF_PRICE_CLOSE, TYPE_OF_PRICE_OPEN, TYPE_OF_PRICE_HIGH, TYPE_OF_PRICE_LOW, TYPE_OF_PRICE_AVG
         length: Indicator period in intervals (default: 14); MACD ignores it
         deviation: BB only — number of standard deviations between the middle and outer bands (default: 2)
@@ -1322,6 +1387,10 @@ async def get_tech_analysis(
         signal_smoothing: MACD only — period of the signal line (default: 9)
     """
     now = datetime.now(timezone.utc)
+    indicator_type = _enum(indicator_type, "INDICATOR_TYPE_")
+    candle_name = _enum(interval, "CANDLE_INTERVAL_")
+    interval = INDICATOR_INTERVALS.get(candle_name) or _enum(interval, "INDICATOR_INTERVAL_")
+    type_of_price = _enum(type_of_price, "TYPE_OF_PRICE_")
     body: dict[str, Any] = {
         "instrumentUid": await _uid(instrument_id),
         "indicatorType": indicator_type,
@@ -1379,7 +1448,7 @@ async def get_order_state(account_id: str, order_id: str) -> str:
 
 
 @read_only_tool
-async def list_shares(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
+async def list_shares(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available shares (stocks).
 
     Warning: returns a large dataset. Use find_instrument for searching specific shares.
@@ -1387,12 +1456,14 @@ async def list_shares(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
-    data = await _call("InstrumentsService", "Shares", {"instrumentStatus": instrument_status})
+    data = await _call("InstrumentsService", "Shares", {
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+    })
     return _fmt(data)
 
 
 @read_only_tool
-async def list_bonds(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
+async def list_bonds(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available bonds.
 
     Warning: returns a large dataset. Use find_instrument for searching specific bonds.
@@ -1400,40 +1471,48 @@ async def list_bonds(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
-    data = await _call("InstrumentsService", "Bonds", {"instrumentStatus": instrument_status})
+    data = await _call("InstrumentsService", "Bonds", {
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+    })
     return _fmt(data)
 
 
 @read_only_tool
-async def list_etfs(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
+async def list_etfs(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available ETFs and funds.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
-    data = await _call("InstrumentsService", "Etfs", {"instrumentStatus": instrument_status})
+    data = await _call("InstrumentsService", "Etfs", {
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+    })
     return _fmt(data)
 
 
 @read_only_tool
-async def list_currencies(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
+async def list_currencies(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available currency instruments.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
-    data = await _call("InstrumentsService", "Currencies", {"instrumentStatus": instrument_status})
+    data = await _call("InstrumentsService", "Currencies", {
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+    })
     return _fmt(data)
 
 
 @read_only_tool
-async def list_futures(instrument_status: str = "INSTRUMENT_STATUS_BASE") -> str:
+async def list_futures(instrument_status: InstrumentStatus = "INSTRUMENT_STATUS_BASE") -> str:
     """Get list of all available futures contracts.
 
     Args:
         instrument_status: INSTRUMENT_STATUS_BASE (tradeable) or INSTRUMENT_STATUS_ALL
     """
-    data = await _call("InstrumentsService", "Futures", {"instrumentStatus": instrument_status})
+    data = await _call("InstrumentsService", "Futures", {
+        "instrumentStatus": _enum(instrument_status, "INSTRUMENT_STATUS_"),
+    })
     return _fmt(data)
 
 

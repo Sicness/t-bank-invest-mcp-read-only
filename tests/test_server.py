@@ -52,6 +52,24 @@ class TestToolList:
         assert description.startswith("Get margin trading attributes for an account")
         assert "\nArgs:\n    account_id: Account ID (get from get_accounts)" in description
 
+    async def test_enum_parameters_list_their_values(self, tools):
+        """The values are in the schema, where a client can show and check them, not only in prose."""
+        by_name = {t.name: t.inputSchema["properties"] for t in tools}
+        assert "CANDLE_INTERVAL_DAY" in by_name["get_candles"]["interval"]["enum"]
+        assert by_name["get_candles"]["interval"]["default"] == "CANDLE_INTERVAL_DAY"
+        assert by_name["get_portfolio"]["currency"]["enum"] == ["RUB", "USD", "EUR"]
+        assert "INDICATOR_TYPE_RSI" in by_name["get_tech_analysis"]["indicator_type"]["enum"]
+        assert "bond" in by_name["find_instrument"]["instrument_kind"]["enum"]
+        for name in ("get_bond_by", "get_share_by", "get_instrument_by"):
+            assert "INSTRUMENT_ID_TYPE_UID" in by_name[name]["id_type"]["enum"]
+
+    async def test_enum_hints_do_not_reject_other_spellings(self):
+        with patch.object(srv, "_call", AsyncMock(return_value={"candles": []})) as mock:
+            await srv.mcp.call_tool("get_candles", {
+                "instrument_id": "e6123145-9665-43e0-8413-cd61b8aa9b13", "interval": "week",
+            })
+        assert mock.call_args[0][2]["interval"] == "CANDLE_INTERVAL_WEEK"
+
     async def test_no_output_schema(self, tools):
         """Tools return a JSON string; a {"result": string} schema would make FastMCP send it twice."""
         assert [t.name for t in tools if t.outputSchema is not None] == []
