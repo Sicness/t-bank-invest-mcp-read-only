@@ -107,6 +107,19 @@ class TestParseDate:
         with pytest.raises(ValueError, match="Cannot parse date"):
             _parse_date(bad)
 
+    @pytest.mark.parametrize("given, expected", [
+        # the `date` of an operation, exactly as the server itself returns it
+        ("2026-09-29T05:30:56.515061Z", datetime(2026, 9, 29, 5, 30, 56, 515061, tzinfo=timezone.utc)),
+        ("2026-09-30T12:00:00+03:00", datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)),
+        ("2026-09-30 10:00:00", datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc)),
+    ])
+    def test_takes_the_forms_the_api_itself_sends(self, given, expected):
+        assert _parse_date(given) == expected
+        assert _parse_date(given, end_of_day=True) == expected  # a time is taken as is
+
+    def test_an_offset_moves_the_request_to_utc(self):
+        assert _ts(_parse_date("2026-09-30T02:00:00+03:00")) == "2026-09-29T23:00:00Z"
+
     def test_surrounding_spaces_ignored(self):
         assert _parse_date(" 2024-01-15 ") == datetime(2024, 1, 15, tzinfo=timezone.utc)
 

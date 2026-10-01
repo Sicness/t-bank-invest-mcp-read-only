@@ -2166,3 +2166,37 @@ class TestSilentlyWrongAnswers:
                 await call()
         mock.assert_not_called()
 
+
+class TestFindInstrumentOrder:
+    async def test_shares_come_before_the_bonds_a_company_name_also_matches(self):
+        # Real case: "Газпром" has 74 tradable matches, and the first 20 in the API's order
+        # were 19 bonds and a future — the share itself was not in the list.
+        def paper(n, kind, name):
+            return {"ticker": f"X{n}", "classCode": "C", "name": name, "instrumentType": kind,
+                    "uid": f"{n:08d}-aaaa-bbbb-cccc-000000000000", "figi": f"F{n}", "isin": f"I{n}",
+                    "lot": 1, "apiTradeAvailableFlag": True}
+        found = [paper(1, "bond", "Газпром капитал 001Р"), paper(2, "futures", "GAZR-12.26"),
+                 paper(3, "bond", "Газпром нефть 003P"), paper(4, "etf", "Фонд Газпром"),
+                 paper(5, "share", "Газпром")]
+        with patch.object(srv, "_call", route(FindInstrument={"instruments": found})):
+            result = json.loads(await srv.find_instrument("газпром", limit=3))
+        assert [i["instrumentType"] for i in result["instruments"]] == ["share", "etf", "bond"]
+        assert result["instruments"][2]["ticker"] == "X1"  # the API's order is kept among bonds
+
+    async def test_an_exact_name_beats_the_kind(self):
+        found = [
+            {"ticker": "A", "name": "Сбер Банк", "instrumentType": "share", "uid": "u-1", "apiTradeAvailableFlag": True},
+            {"ticker": "B", "name": "Сбербанк", "instrumentType": "bond", "uid": "u-2", "apiTradeAvailableFlag": True},
+        ]
+        with patch.object(srv, "_call", route(FindInstrument={"instruments": found})):
+            result = json.loads(await srv.find_instrument("Сбербанк"))
+        assert [i["ticker"] for i in result["instruments"]] == ["B", "A"]
+
+
+class TestConsensusPageNumber:
+    async def test_the_old_parameter_is_accepted_and_changes_nothing(self):
+        mock = make_paged_call_mock([([{"assetUid": "asset-target"}], 1)])
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_consensus_forecasts("asset-target", page_number=3))
+        assert result["assetUid"] == "asset-target"
+        assert calls_to(mock, "GetConsensusForecasts")[0]["paging"]["pageNumber"] == 0

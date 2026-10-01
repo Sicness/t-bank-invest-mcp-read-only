@@ -11,7 +11,7 @@ import re
 import ssl
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -33,6 +33,10 @@ CA_FILE = Path(__file__).parent / "certs" / "russian_trusted_root_ca.pem"
 CA_SHA256 = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
 
 TIMEOUT_SECONDS = 30
+# The API counts requests per minute and per service (200 for most, 50 for UsersService) and
+# says in x-ratelimit-reset how many seconds of the minute are left. A request refused for
+# that reason is repeated once the minute is over, if that is no longer than this.
+RATE_LIMIT_WAIT_SECONDS = 60
 
 mcp = FastMCP(
     "t-bank-invest-mcp-read-only",
@@ -207,6 +211,17 @@ def _get_client() -> httpx.AsyncClient:
 
 def _api_error(service: str, method: str, resp: httpx.Response) -> str:
     """What the API said went wrong: its message and error code, not just the HTTP status."""
+    if resp.status_code == 429:
+        limit = resp.headers.get("x-ratelimit-limit", "").split(",")[0].strip()
+        wait = _rate_limit_reset(resp)
+        return (
+            f"T-Bank API returned HTTP 429 for {service}/{method}: the rate limit of {service}"
+            + (f" ({limit} requests a minute)" if limit else "")
+            + " is used up"
+            + (f"; it resets in {wait} seconds" if wait is not None else "")
+            + ". Repeat the call then, and make fewer calls: a UID or a FIGI needs no lookup,"
+            " a ticker or an ISIN costs a search."
+        )
     try:
         payload = resp.json()
     except ValueError:
@@ -231,13 +246,27 @@ def _transport_error(service: str, method: str, exc: httpx.RequestError, token: 
     return f"T-Bank API request {service}/{method} failed ({type(exc).__name__}): {detail}"
 
 
+def _rate_limit_reset(resp: httpx.Response) -> int | None:
+    """Seconds until the API's request counter starts again, if the response says."""
+    try:
+        return max(int(resp.headers.get("x-ratelimit-reset", "")), 0)
+    except ValueError:
+        return None
+
+
 async def _call(service: str, method: str, body: dict[str, Any] | None = None) -> dict:
     url = f"{BASE_URL}/{SERVICE_PREFIX}.{service}/{method}"
     headers = _headers()
-    try:
-        resp = await _get_client().post(url, headers=headers, json=body or {})
-    except httpx.RequestError as e:
-        raise type(e)(_transport_error(service, method, e, _get_token())) from None
+    for attempt in (1, 2):
+        try:
+            resp = await _get_client().post(url, headers=headers, json=body or {})
+        except httpx.RequestError as e:
+            raise type(e)(_transport_error(service, method, e, _get_token())) from None
+        # Out of requests for this minute: wait for the next one, once.
+        wait = _rate_limit_reset(resp) if resp.status_code == 429 and attempt == 1 else None
+        if wait is None or wait > RATE_LIMIT_WAIT_SECONDS:
+            break
+        await asyncio.sleep(wait + 1)
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -257,7 +286,10 @@ def _ts(dt: datetime) -> str:
 def _parse_date(
     s: str | None, default: datetime | None = None, *, end_of_day: bool = False
 ) -> datetime | None:
-    """Parse a UTC date or datetime string; an empty one gives default.
+    """Parse a date or datetime string into UTC; an empty one gives default.
+
+    Any ISO 8601 form is taken, the ones the API itself sends included (fractions of a
+    second, Z, an offset); a time without an offset is UTC.
 
     end_of_day is for the end of a range: a date without a time then means 23:59:59 of that
     day, so that "to 2024-01-31" includes the 31st. A string with a time is taken as is.
@@ -266,17 +298,21 @@ def _parse_date(
         return default
     s = s.strip()
     try:
-        day = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day = datetime.combine(date.fromisoformat(s), datetime.min.time(), timezone.utc)
     except ValueError:
         pass
     else:
         return day + timedelta(days=1, seconds=-1) if end_of_day else day
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    raise ValueError(f"Cannot parse date: {s!r}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS format.")
+    try:
+        moment = datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError(
+            f"Cannot parse date: {s!r}. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS; the time is UTC "
+            "unless it ends with an offset such as +03:00."
+        ) from None
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 def _period(from_date: str, to_date: str, *, back: int = 0, ahead: int = 0) -> dict[str, str]:
@@ -594,7 +630,9 @@ async def get_accounts() -> str:
     """Get list of all user investment accounts with their types and statuses.
 
     Returns account IDs needed for other operations (portfolio, positions, operations).
-    Account types: TINKOFF (broker), TINKOFF_IIS (individual investment account), INVEST_BOX, INVEST_FUND.
+    Account types: TINKOFF (broker), TINKOFF_IIS (individual investment account), INVEST_BOX,
+    INVEST_FUND, DFA (digital financial assets). closedDate of 1970-01-01 means the account
+    is open.
     """
     data = await _call("UsersService", "GetAccounts", {"status": "ACCOUNT_STATUS_ALL"})
     return _fmt(data)
@@ -632,7 +670,10 @@ async def get_portfolio(account_id: AccountId, currency: PortfolioCurrency = "RU
 
     expectedYield and dailyYield of a position are amounts of money in the position's
     currency, not percentages; the portfolio's own expectedYield, at the top level, is a
-    percentage. positionUid is the key of a position: one paper can come under several
+    percentage. A bond's averagePositionPrice and currentPrice are money per bond, and
+    currentNkd is the accrued interest per bond in the same currency — while get_last_prices,
+    get_candles and get_order_book give a bond's price in percent of its nominal.
+    positionUid is the key of a position: one paper can come under several
     figi and instrumentUid (its listings), all with the same positionUid.
 
     Args:
@@ -656,7 +697,8 @@ async def get_positions(account_id: AccountId) -> str:
 
     Unlike get_portfolio, this returns raw position balances without price calculations.
     A field that is zero or false (blocked, exchangeBlocked) is left out. balance is a
-    string holding an integer; positionUid is the key of the position, the same one the
+    string holding an integer — for a fund held in fractions of a unit it is cut down to
+    whole units, and the exact quantity is in get_portfolio; positionUid is the key of the position, the same one the
     portfolio and the operations carry.
 
     Args:
@@ -763,13 +805,16 @@ async def get_operations_by_cursor(
 
     Returns hasNext and nextCursor for pagination: pass nextCursor as cursor to get the
     next page. Each operation item includes detailed info: id, type (the code, e.g.
-    OPERATION_TYPE_BUY), state, payment, price, commission, yield, quantity, quantityDone,
-    quantityRest, ticker, figi, instrumentUid, positionUid, trades. A field that is zero or
-    empty is left out, and so are fields that repeat another one or the request
+    OPERATION_TYPE_BUY), name and description, state, date, payment, price, commission,
+    yield, accruedInt, quantity, quantityDone, quantityRest, ticker, classCode, figi,
+    instrumentType, instrumentUid, positionUid, tradesInfo.trades (the trades of the order)
+    and childOperations (its commissions and taxes). A field that is zero or empty is left
+    out, and so are fields that repeat another one or the request
     (instrumentKind, assetUid, brokerAccountId, the per-item cursor).
 
     Canceled orders are operations as well, and carry the quantity and the payment they
-    asked for: pass state="EXECUTED" before adding up money or quantities. quantity is what
+    asked for — a canceled buy with a positive payment, where an executed one is negative:
+    pass state="EXECUTED" before adding up money or quantities. quantity is what
     the order asked for, quantityDone what was executed (left out when nothing was) and
     quantityRest what was not — an order can be executed in part. A bond repayment has no
     quantity. Prices and quantities are as they were at the time: unlike candles, they are
@@ -818,6 +863,7 @@ async def get_operations_by_cursor(
 # ── Instruments ──────────────────────────────────────────────────────────────
 
 
+_SEARCH_KIND_ORDER = {"share": 0, "etf": 1, "bond": 2, "currency": 3}
 _SEARCH_FIELDS = ("ticker", "classCode", "name", "instrumentType", "uid", "figi", "isin", "lot")
 
 
@@ -833,8 +879,9 @@ async def find_instrument(
     Returns {"instruments": [...], "total": N}. Each instrument has ticker, classCode, name,
     instrumentType, uid, figi, isin and lot; forQualInvestorFlag appears when it is true and
     apiTradeAvailableFlag when it is false. An instrument whose ticker, ISIN or FIGI equals
-    the query comes first. "total" counts every match; "note" says when the list was cut to
-    limit or when nothing tradable matched and non-tradable listings are shown instead.
+    the query comes first, then shares, funds, bonds and the rest. "total" counts every
+    match; "note" says when the list was cut to limit or when nothing tradable matched and
+    non-tradable listings are shown instead.
 
     A paper has many listings (one per board, most of them not tradable), and a company's
     name also matches all its bonds — narrow the search with instrument_kind.
@@ -856,8 +903,17 @@ async def find_instrument(
             note = "nothing tradable through the API matched; these listings are not tradable"
 
     exact = {i.get("uid") for i in _exact(found, query.strip())}
-    # Stable: the API's own order is kept within each group.
-    found.sort(key=lambda i: (i.get("uid") not in exact, not i.get("apiTradeAvailableFlag")))
+    name = query.strip().casefold()
+    # What the query names exactly comes first, then what is called exactly that; after
+    # that shares before the funds, bonds and futures a company's name also matches — the
+    # API's own order would fill a short list with bonds and leave the share out. Stable:
+    # the API's order is kept within each group.
+    found.sort(key=lambda i: (
+        i.get("uid") not in exact,
+        i.get("name", "").casefold() != name,
+        _SEARCH_KIND_ORDER.get(i.get("instrumentType"), len(_SEARCH_KIND_ORDER)),
+        not i.get("apiTradeAvailableFlag"),
+    ))
 
     instruments = []
     for i in found[:limit]:
@@ -980,11 +1036,15 @@ async def get_bond_events(
     maturity or a distant offer needs an explicit from_date/to_date range to show up.
     A field of an event that is zero or empty is left out.
 
+    A coupon event carries couponInterestRate, the coupon's rate in percent a year — the
+    bond itself (get_bond_by) does not have it. Partial repayments (amortization) come as
+    MTY events with operationType "OA" and `value` in percent of the nominal; the final
+    repayment is the MTY event with operationType "OM".
+
     Args:
         instrument_id: Bond ticker, FIGI, ISIN or UID
-        type: Event type filter (empty = all): CPN (coupon), CALL (offer), MTY (maturity),
-            CONV (conversion). The EVENT_TYPE_ prefix is optional; COUPON, MATURITY and
-            CONVERSION are accepted too.
+        type: Event type filter (empty = all): CPN (coupon), CALL (offer), MTY (maturity
+            and amortization), CONV (conversion)
         from_date: Start date (YYYY-MM-DD), default: chosen by the API
         to_date: End date (YYYY-MM-DD, inclusive), default: chosen by the API
     """
@@ -1120,7 +1180,9 @@ async def get_asset_fundamentals(assets: str) -> str:
     """Get fundamental financial data for assets: P/E, P/BV, EPS, ROE, revenue, market cap, etc.
 
     The API keys fundamentals by asset UID, which is not the instrument UID; whatever is
-    passed here is converted. Each item of the result carries its assetUid.
+    passed here is converted. Each item of the result carries its assetUid, and the items
+    come in the order of the request. A value of 0 means the API has no figure (P/E of a
+    company at a loss, EBITDA of a bank), not zero. Bonds and funds have no fundamentals.
 
     Args:
         assets: Comma-separated list of tickers, FIGIs, ISINs, instrument UIDs or asset UIDs
@@ -1208,6 +1270,7 @@ async def get_consensus_forecasts(
     instrument_id: str,
     page_limit: int = 100,
     max_pages: int = 50,
+    page_number: int = 0,
 ) -> str:
     """Get the analyst consensus forecast for one instrument: target price, recommendation,
     number of analysts.
@@ -1221,6 +1284,8 @@ async def get_consensus_forecasts(
         instrument_id: Ticker, FIGI, ISIN, instrument UID or asset UID
         page_limit: Page size used while scanning (default: 100; a non-positive value means 100)
         max_pages: Safety cap on how many pages to scan before giving up (default: 50, at least 1)
+        page_number: Deprecated and ignored, kept for existing callers: the tool reads the
+            pages itself
     """
     # A UID the instrument lookup does not know is taken to be an asset UID already.
     uid = await _uid(instrument_id, figi_ok=False, any_listing=True)
@@ -1404,13 +1469,15 @@ async def get_candles(
     "columns". Volumes are in lots; the two columns splitting volume into buys and sells are
     there when the API has them. For day, week and month candles "time" is a date.
     "last_candle_complete": false appears when the last candle's period is still running —
-    its close is the current price, not a close. Candles from before a split or a
-    consolidation usually come recalculated to today's shares, while operations keep the
-    prices and quantities of their day.
+    its close is the current price, not a close. A bond's prices are in percent of its
+    nominal, not in money. Candles from before a split or a consolidation usually come
+    recalculated to today's shares, while operations keep the prices and quantities of
+    their day.
 
     The API limits the period one request may span: a day for minute candles, a week for
     5-10 minute ones, 3 weeks for 15-30 minute ones, 3 months for hourly ones, 6 years for
-    daily ones.
+    daily ones. A year of daily candles is about 22,000 characters; several years of them
+    do not fit into a client's limit — ask for weekly or monthly candles instead.
 
     Args:
         instrument_id: Instrument ticker, FIGI, ISIN or UID
@@ -1490,6 +1557,8 @@ async def get_last_prices(instrument_ids: str) -> str:
 async def get_order_book(instrument_id: str, depth: int = 20) -> str:
     """Get order book (market depth) for an instrument: bids, asks, last price, spread.
 
+    A bond's prices are in percent of its nominal, not in money.
+
     Args:
         instrument_id: Instrument ticker, FIGI, ISIN or UID
         depth: Order book depth 1-50 (default: 20)
@@ -1560,7 +1629,8 @@ async def get_tech_analysis(
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         interval: INDICATOR_INTERVAL_ONE_DAY (default), _ONE_HOUR, _WEEK, _MONTH and the minute
                   and hour steps listed in the schema. The API names intervals differently
-                  here than in get_candles; a CANDLE_INTERVAL_* name is translated.
+                  here than in get_candles; the CANDLE_INTERVAL_* names of the same steps
+                  are taken too.
         type_of_price: TYPE_OF_PRICE_CLOSE, TYPE_OF_PRICE_OPEN, TYPE_OF_PRICE_HIGH, TYPE_OF_PRICE_LOW, TYPE_OF_PRICE_AVG
         length: Indicator period in intervals (default: 14); MACD ignores it
         deviation: BB only — number of standard deviations between the middle and outer bands (default: 2)

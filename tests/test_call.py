@@ -203,3 +203,54 @@ class TestCallTransportErrors:
     async def test_error_without_details(self):
         error = await self._error(httpx.ReadError(""), httpx.ReadError)
         assert str(error).endswith("failed (ReadError): no details")
+
+
+class TestCallRateLimit:
+    """HTTP 429: the API is out of requests for this minute and says when the next one starts."""
+
+    @staticmethod
+    def _response(status, headers=None, body=None):
+        response = httpx.Response(status, headers=headers or {}, json=body if body is not None else {})
+        response.request = httpx.Request("POST", f"{BASE_URL}/{SERVICE_PREFIX}.InstrumentsService/FindInstrument")
+        return response
+
+    async def test_waits_for_the_next_minute_and_repeats_once(self):
+        limited = self._response(429, {"x-ratelimit-limit": "200, 200;w=60", "x-ratelimit-reset": "7"})
+        client = AsyncMock()
+        client.post.side_effect = [limited, self._response(200, body={"instruments": []})]
+        with patch("httpx.AsyncClient", return_value=client), \
+                patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
+            assert await _call("InstrumentsService", "FindInstrument", {}) == {"instruments": []}
+        assert client.post.await_count == 2
+        sleep.assert_awaited_once_with(8)  # the seconds left of the minute, and one more
+
+    async def test_a_second_refusal_is_an_error_that_says_why(self):
+        limited = self._response(429, {"x-ratelimit-limit": "200, 200;w=60", "x-ratelimit-reset": "30"})
+        client = AsyncMock()
+        client.post.return_value = limited
+        with patch("httpx.AsyncClient", return_value=client), patch.object(server.asyncio, "sleep", AsyncMock()):
+            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                await _call("InstrumentsService", "FindInstrument", {})
+        assert client.post.await_count == 2
+        message = str(exc_info.value)
+        assert "rate limit of InstrumentsService (200 requests a minute)" in message
+        assert "resets in 30 seconds" in message
+
+    async def test_does_not_wait_longer_than_a_tool_call_should_take(self):
+        limited = self._response(429, {"x-ratelimit-reset": str(server.RATE_LIMIT_WAIT_SECONDS + 1)})
+        client = AsyncMock()
+        client.post.return_value = limited
+        with patch("httpx.AsyncClient", return_value=client), \
+                patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
+            with pytest.raises(httpx.HTTPStatusError):
+                await _call("InstrumentsService", "FindInstrument", {})
+        assert client.post.await_count == 1
+        sleep.assert_not_awaited()
+
+    async def test_without_the_reset_header_there_is_nothing_to_wait_for(self):
+        client = AsyncMock()
+        client.post.return_value = self._response(429)
+        with patch("httpx.AsyncClient", return_value=client):
+            with pytest.raises(httpx.HTTPStatusError, match="rate limit of InstrumentsService is used up"):
+                await _call("InstrumentsService", "FindInstrument", {})
+        assert client.post.await_count == 1

@@ -65,6 +65,23 @@ class TestToolList:
             })
         assert mock.call_args[0][2]["interval"] == "CANDLE_INTERVAL_WEEK"
 
+    async def test_tech_analysis_schema_keeps_the_interval_names_it_used_to_take(self, tools):
+        """A client that enforces the schema must not refuse what the server still translates."""
+        by_name = {t.name: t.inputSchema["properties"] for t in tools}
+        interval = by_name["get_tech_analysis"]["interval"]["enum"]
+        assert "INDICATOR_INTERVAL_ONE_DAY" in interval and "CANDLE_INTERVAL_DAY" in interval
+
+    async def test_account_id_may_arrive_as_a_number(self, tools):
+        by_name = {t.name: t.inputSchema["properties"] for t in tools}
+        assert by_name["get_orders"]["account_id"]["type"] == "string"
+        with patch.object(srv, "_call", AsyncMock(return_value={"orders": []})) as mock:
+            await srv.mcp.call_tool("get_orders", {"account_id": 2010663975})
+        assert mock.call_args[0][2] == {"accountId": "2010663975"}
+
+    async def test_removed_parameter_of_consensus_forecasts_is_still_taken(self, tools):
+        by_name = {t.name: t.inputSchema["properties"] for t in tools}
+        assert "page_number" in by_name["get_consensus_forecasts"]
+
     async def test_no_output_schema(self, tools):
         """Tools return a JSON string; a {"result": string} schema would make FastMCP send it twice."""
         assert [t.name for t in tools if t.outputSchema is not None] == []
