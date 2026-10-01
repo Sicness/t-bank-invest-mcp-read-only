@@ -3,6 +3,8 @@ name = "t-bank-invest-mcp-read-only"
 version = "0.1.0"
 description = "MCP server for reading T-Bank (Tinkoff) investment portfolio data"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "mcp[cli]>=1.0.0,<2",
     "httpx>=0.27.0",

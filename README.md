@@ -140,4 +140,4 @@ t-bank-invest-mcp-read-only
 
 ## Лицензия
 
-MIT
+[MIT](LICENSE)
