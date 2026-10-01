@@ -19,7 +19,7 @@ pytest tests/test_tools.py -k snapshot
 grep -c '^@mcp.tool()' src/tbank_invest_mcp/server.py   # how many tools there are
 
 export TBANK_INVEST_TOKEN=...     # https://www.tbank.ru/invest/settings/api/
-t-bank-invest-mcp-read-only       # run over stdio (same as python -m tbank_invest_mcp.server)
+t-bank-invest-mcp-read-only       # run over stdio (same as python -m tbank_invest_mcp)
 mcp dev src/tbank_invest_mcp/server.py   # run under the MCP Inspector
 ```
 
@@ -86,6 +86,14 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 3. Add a test class to `tests/test_tools.py` covering the request body, defaults and any shaping of the result.
 4. Update the tool table in `README.md` (Russian), and the helper table here if a helper was added.
 5. Renaming a tool, renaming or removing a parameter, or changing an output shape breaks existing clients — say so in the commit message.
+
+## Releasing
+
+Users install with `uvx` straight from this repository (see `README.md`), so the wheel must be self-contained: anything the server reads at runtime, like the pinned CA, has to live inside `src/tbank_invest_mcp/`. The console script name, the package name and the `tbank_invest_mcp.server:main` entry point are part of the install contract — existing client configs point at them.
+
+To release: set `version` in `pyproject.toml` to the release number, commit, then tag that commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` refuses a tag that differs from the version, builds sdist and wheel, runs the test suite against the installed wheel, publishes to PyPI through Trusted Publishing (the `pypi` environment; no API token is stored) and creates a GitHub Release with generated notes.
+
+The first published release will be 1.0.0; until then `version` stays `1.0.0.dev0` and tool contracts may still change. From 1.0.0 on, semantic versioning applies to the tool contract: major for a renamed or removed tool or parameter or a changed output shape, minor for new tools and parameters, patch for fixes.
 
 ## Dependencies
 

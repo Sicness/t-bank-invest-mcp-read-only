@@ -1,15 +1,35 @@
 [project]
 name = "t-bank-invest-mcp-read-only"
-version = "0.1.0"
+version = "1.0.0.dev0"
 description = "MCP server for reading T-Bank (Tinkoff) investment portfolio data"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "Anton Balashov" }]
+keywords = ["mcp", "model-context-protocol", "t-bank", "tinkoff", "invest", "portfolio", "read-only"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
 dependencies = [
     "mcp[cli]>=1.0.0,<2",
     "httpx>=0.27.0",
     "certifi",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Sicness/t-bank-invest-mcp-read-only"
+Repository = "https://github.com/Sicness/t-bank-invest-mcp-read-only"
+Issues = "https://github.com/Sicness/t-bank-invest-mcp-read-only/issues"
+Changelog = "https://github.com/Sicness/t-bank-invest-mcp-read-only/releases"
 
 [build-system]
 requires = ["hatchling"]
@@ -17,6 +37,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tbank_invest_mcp"]
+
+# An explicit list: by default hatch ships every file .gitignore does not
+# exclude, which on a developer machine includes untracked local files.
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/LICENSE"]
 
 [project.optional-dependencies]
 test = [
