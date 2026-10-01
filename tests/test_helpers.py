@@ -13,7 +13,7 @@ from tbank_invest_mcp.server import (
     _get_token,
     _headers,
     _parse_date,
-    _quotation_to_float,
+    _number,
     _to_quotation,
     _ts,
 )
@@ -172,7 +172,7 @@ class TestToQuotation:
 
     @pytest.mark.parametrize("value", [2.0, 2.5, 0.05, 312.45, -1.5])
     def test_round_trip(self, value):
-        assert _quotation_to_float(_to_quotation(value)) == pytest.approx(value)
+        assert _number(_to_quotation(value)) == pytest.approx(value)
 
 
 def q(units, nano=0):

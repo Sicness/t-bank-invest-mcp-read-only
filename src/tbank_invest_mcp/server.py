@@ -9,6 +9,7 @@ import json
 import os
 import re
 import ssl
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,7 +47,6 @@ mcp = FastMCP(
         "An instrument parameter takes a ticker, FIGI, ISIN or UID; TICKER_CLASSCODE "
         "(SBER_TQBR) picks one listing when a ticker has several. Search by name with "
         "find_instrument. "
-        "Enum values may be given without their prefix (DAY for CANDLE_INTERVAL_DAY). "
         "Dates are UTC. A from_date/to_date given as YYYY-MM-DD covers whole days: "
         "to_date includes that day up to 23:59:59."
     ),
@@ -73,8 +73,9 @@ def read_only_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
 def _choices(*values: str) -> Any:
     """Type of a string parameter whose JSON schema lists the values to pick from.
 
-    Only a hint for the client: nothing is validated against the list, so the short and
-    differently-cased spellings that _enum accepts keep working.
+    The list is the documented spelling, and a client may enforce it. The server itself
+    validates nothing against it: _enum also takes a value without its prefix or in another
+    case, which is leniency towards a caller that got through, not something to advertise.
     """
     return Annotated[str, Field(json_schema_extra={"enum": list(values)})]
 
@@ -184,8 +185,6 @@ def _api_error(service: str, method: str, resp: httpx.Response) -> str:
         detail = str(payload["message"])
         if payload.get("description"):
             detail += f" (error code {payload['description']})"
-        if str(payload.get("description")) == "50002":  # instrument not found
-            detail += ". Name an instrument by ticker, FIGI, ISIN or UID; find_instrument searches by name"
     else:
         detail = resp.text.strip()[:300] or "no details in the response"
     return f"T-Bank API returned HTTP {resp.status_code} for {service}/{method}: {detail}"
@@ -321,6 +320,7 @@ def _is_empty(value: Any) -> bool:
 
 def _trimmed(data: dict, *list_keys: str, drop: tuple[str, ...] = ()) -> dict:
     """_plain(data) whose items in the named lists have lost their zero, false and empty fields.
+    Already plain: dump it with _json, not _fmt.
 
     Positions, operations and bond events are long lists of wide objects in which most
     fields say "nothing here"; leaving those out is what makes such a response fit into a
@@ -337,16 +337,14 @@ def _trimmed(data: dict, *list_keys: str, drop: tuple[str, ...] = ()) -> dict:
     return out
 
 
-def _fmt(data: Any) -> str:
+def _json(data: Any) -> str:
     # Compact: the reader is a model, and indentation is a third or more of a response.
-    return json.dumps(_plain(data), ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
-def _quotation_to_float(q: dict[str, Any] | None) -> float | None:
-    """Convert a Quotation/MoneyValue object ({units, nano}) to a plain float."""
-    if not q:
-        return None
-    return float(q.get("units", 0)) + float(q.get("nano", 0)) / 1_000_000_000
+def _fmt(data: Any) -> str:
+    """What a tool returns: the response made plain, as compact JSON."""
+    return _json(_plain(data))
 
 
 def _to_quotation(value: float) -> dict[str, Any]:
@@ -358,15 +356,25 @@ def _to_quotation(value: float) -> dict[str, Any]:
 # ── Instrument identifiers ──────────────────────────────────────────────────
 
 _UID_RE = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+# Bloomberg FIGIs and the ones T-Bank assigns itself. Other 12-character identifiers — ISINs,
+# bond tickers — are not FIGIs and do need a lookup.
+_FIGI_RE = re.compile(r"(BBG|TCS)[0-9A-Z]{9}")
 
 INSTRUMENT_KINDS = (
     "SHARE", "BOND", "ETF", "CURRENCY", "FUTURES", "OPTION", "SP", "CLEARING_CERTIFICATE",
     "INDEX", "COMMODITY",
 )
 
-# (identifier, kind) → the instrument it names, or None if nothing matches. Kept for the life
-# of the process: an identifier does not change what it names.
-_resolved: dict[tuple[str, str], dict | None] = {}
+# (identifier, kind, any_listing) → the instrument it names. Kept for the life of the
+# process: an identifier does not change what it names.
+_resolved: dict[tuple[str, str, bool], dict] = {}
+# The same key → when a lookup last found nothing. That is only remembered for a while: a
+# paper may be listed tomorrow, and a search may come back empty once.
+_missed: dict[tuple[str, str, bool], float] = {}
+MISS_TTL_SECONDS = 600
+# How many identifiers of one list are looked up at a time; the API allows 200 requests a
+# minute per service, and a list can hold a whole portfolio.
+LOOKUP_BATCH = 8
 
 
 def _is_uid(identifier: str) -> bool:
@@ -395,17 +403,24 @@ def _exact(instruments: list[dict], identifier: str, class_code: str = "") -> li
     return list(found.values())
 
 
-async def _find_exact(identifier: str, kind: str = "") -> dict | None:
+async def _find_exact(identifier: str, kind: str = "", any_listing: bool = False) -> dict | None:
     """The instrument a ticker, FIGI, ISIN or TICKER_CLASSCODE names, or None if none does.
 
     Listings tradable through the API are preferred — for a share that leaves its main
     board out of a dozen technical ones. Raises ValueError when several instruments still
     match, naming them, rather than picking one silently.
+
+    Several listings of one paper (one ISIN) are told apart by which of them has candle
+    history. If that does not single one out, any_listing decides: callers after something
+    the paper has whatever board it trades on — dividends, coupons, fundamentals — take the
+    first, the rest get the error. Different papers under one ticker are always an error.
     """
     identifier = identifier.strip()
-    key = (identifier.upper(), kind.upper())
+    key = (identifier.upper(), kind.upper(), any_listing)
     if key in _resolved:
         return _resolved[key]
+    if time.monotonic() - _missed.get(key, float("-inf")) < MISS_TTL_SECONDS:
+        return None
 
     attempts = [(identifier, "")]
     if "_" in identifier:  # after the plain reading: tickers such as CNYRUB_TOM have one too
@@ -419,6 +434,14 @@ async def _find_exact(identifier: str, kind: str = "") -> dict | None:
         if hits:
             break
 
+    if len(hits) > 1 and len({i.get("isin") for i in hits}) == 1 and hits[0].get("isin"):
+        # Several listings of one paper. The API keeps candle history for one of them — the
+        # board the paper really trades on; the rest are negotiated-deal and technical boards.
+        with_history = [i for i in hits if i.get("first1dayCandleDate")]
+        if len(with_history) == 1 or (with_history and any_listing):
+            hits = with_history[:1]
+        elif any_listing:
+            hits = hits[:1]
     if len(hits) > 1:
         names = ", ".join(
             f"{i.get('ticker')}_{i.get('classCode')} ({i.get('name')}, {i.get('instrumentType')})"
@@ -428,21 +451,48 @@ async def _find_exact(identifier: str, kind: str = "") -> dict | None:
             f"{identifier!r} names {len(hits)} instruments: {names}. "
             "Pass one of these TICKER_CLASSCODE forms or the instrument's UID."
         )
-    _resolved[key] = hits[0] if hits else None
-    return _resolved[key]
+    if not hits:
+        _missed[key] = time.monotonic()
+        return None
+    _resolved[key] = hits[0]
+    return hits[0]
 
 
-async def _uid(identifier: str, kind: str = "") -> str:
-    """Instrument UID for a ticker, FIGI, ISIN or UID.
+async def _uid(
+    identifier: str, kind: str = "", *, figi_ok: bool = True, any_listing: bool = False
+) -> str:
+    """What to send the API for a ticker, FIGI, ISIN or UID: the instrument's UID.
 
-    An identifier nothing matches is returned as it came, so the API gets to answer for it
-    the way it always has.
+    A UID needs no lookup, and neither does a FIGI where the method takes one (figi_ok;
+    false for the few that take a UID only). An identifier nothing matches is returned as
+    it came, so the API gets to answer for it the way it always has — unless it is plainly
+    a name, which is an error here. any_listing: see _find_exact.
     """
     identifier = identifier.strip()
     if not identifier or _is_uid(identifier):
         return identifier
-    instrument = await _find_exact(identifier, kind)
-    return instrument["uid"] if instrument else identifier
+    if figi_ok and _FIGI_RE.fullmatch(identifier):
+        return identifier
+    instrument = await _find_exact(identifier, kind, any_listing)
+    if instrument:
+        return instrument["uid"]
+    if not identifier.isascii() or " " in identifier:
+        # Not something the API could take for an identifier either: a name.
+        raise ValueError(
+            f"No instrument has {identifier!r} as its ticker, FIGI, ISIN or UID. "
+            "find_instrument searches by name"
+        )
+    return identifier
+
+
+async def _each(identifiers: list[str], resolve: Callable[[str], Any]) -> list[str]:
+    """resolve() for every identifier of a list: each distinct one once, a few at a time."""
+    distinct = list(dict.fromkeys(identifiers))
+    resolved: dict[str, str] = {}
+    for start in range(0, len(distinct), LOOKUP_BATCH):
+        batch = distinct[start:start + LOOKUP_BATCH]
+        resolved.update(zip(batch, await asyncio.gather(*(resolve(i) for i in batch))))
+    return [resolved[i] for i in identifiers]
 
 
 # ── Account & User ──────────────────────────────────────────────────────────
@@ -499,7 +549,7 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
     body: dict[str, Any] = {"accountId": account_id, "currency": currency_map[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
     # The two dropped fields are deprecated in the API contract.
-    return _fmt(_trimmed(
+    return _json(_trimmed(
         data, "positions", "virtualPositions", drop=("averagePositionPricePt", "quantityLots"),
     ))
 
@@ -515,7 +565,7 @@ async def get_positions(account_id: str) -> str:
         account_id: Account ID (get from get_accounts)
     """
     data = await _call("OperationsService", "GetPositions", {"accountId": account_id})
-    return _fmt(_trimmed(data, "securities", "futures", "options"))
+    return _json(_trimmed(data, "securities", "futures", "options"))
 
 
 @read_only_tool
@@ -569,10 +619,11 @@ async def get_operations(
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     if figi:
         # This method filters by FIGI only; take it from whatever names the instrument.
-        instrument = await _find_exact(figi)
+        figi = figi.strip()
+        instrument = None if _FIGI_RE.fullmatch(figi) else await _find_exact(figi)
         body["figi"] = (instrument or {}).get("figi") or figi
     data = await _call("OperationsService", "GetOperations", body)
-    return _fmt(_trimmed(data, "operations"))
+    return _json(_trimmed(data, "operations"))
 
 
 @read_only_tool
@@ -631,7 +682,7 @@ async def get_operations_by_cursor(
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
-    return _fmt(_trimmed(data, "items"))
+    return _json(_trimmed(data, "items"))
 
 
 # ── Instruments ──────────────────────────────────────────────────────────────
@@ -690,10 +741,11 @@ async def find_instrument(
         instruments.append(item)
 
     result: dict[str, Any] = {"instruments": instruments, "total": len(found)}
+    notes = [note] if note else []
     if len(found) > limit:
-        note = f"showing {limit} of {len(found)}; narrow the query or instrument_kind, or raise limit"
-    if note:
-        result["note"] = note
+        notes.append(f"showing {limit} of {len(found)}; narrow the query or instrument_kind, or raise limit")
+    if notes:
+        result["note"] = "; ".join(notes)
     return _fmt(result)
 
 
@@ -777,14 +829,14 @@ async def get_bond_coupons(
     # Both have defaults only so that the old figi parameter keeps working. Left to the API,
     # a call with neither fails with "Missing parameter: figi", which points at the wrong one.
     if not (instrument_id or figi):
-        raise ValueError("instrument_id is required: the bond's FIGI or UID")
+        raise ValueError("instrument_id is required: the bond's ticker, FIGI, ISIN or UID")
     now = datetime.now(timezone.utc)
     body: dict[str, Any] = {
         "from": _ts(_parse_date(from_date, now)),
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     }
     if instrument_id:
-        body["instrumentId"] = await _uid(instrument_id, "bond")
+        body["instrumentId"] = await _uid(instrument_id, "bond", any_listing=True)
     if figi:
         body["figi"] = figi
     data = await _call("InstrumentsService", "GetBondCoupons", body)
@@ -821,13 +873,13 @@ async def get_bond_events(
     if type:  # checked before anything is requested
         name = type.strip().upper()
         body["type"] = _enum(BOND_EVENT_ALIASES.get(name, type), "EVENT_TYPE_", BOND_EVENT_TYPES)
-    body["instrumentId"] = await _uid(instrument_id, "bond")
+    body["instrumentId"] = await _uid(instrument_id, "bond", any_listing=True)
     if from_date:
         body["from"] = _ts(_parse_date(from_date))
     if to_date:
         body["to"] = _ts(_parse_date(to_date, end_of_day=True))
     data = await _call("InstrumentsService", "GetBondEvents", body)
-    return _fmt(_trimmed(data, "events"))
+    return _json(_trimmed(data, "events"))
 
 
 @read_only_tool
@@ -919,7 +971,7 @@ async def get_dividends(
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetDividends", {
-        "instrumentId": await _uid(instrument_id),
+        "instrumentId": await _uid(instrument_id, any_listing=True),
         "from": _ts(_parse_date(from_date, now - timedelta(days=730))),
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
@@ -941,7 +993,7 @@ async def get_accrued_interests(
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAccruedInterests", {
-        "instrumentId": await _uid(instrument_id, "bond"),
+        "instrumentId": await _uid(instrument_id, "bond", any_listing=True),
         "from": _ts(_parse_date(from_date, now - timedelta(days=30))),
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),
     })
@@ -959,9 +1011,13 @@ async def get_asset_fundamentals(assets: str) -> str:
         assets: Comma-separated list of tickers, FIGIs, ISINs, instrument UIDs or asset UIDs
     """
     given = [a.strip() for a in assets.split(",") if a.strip()]
-    asset_list = await asyncio.gather(*(_asset_uid_for(a) for a in given))
-    data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": list(asset_list)})
+    asset_list = await _each(given, _asset_uid_for)
+    data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": asset_list})
     return _fmt(data)
+
+
+# instrument UID → asset UID; an instrument stays with its asset.
+_asset_uids: dict[str, str] = {}
 
 
 async def _asset_uid(instrument_uid: str) -> str:
@@ -970,6 +1026,8 @@ async def _asset_uid(instrument_uid: str) -> str:
     Fundamentals and consensus forecasts are keyed by asset UID, which is a different
     identifier from the instrument UID that FindInstrument and the *By lookups return.
     """
+    if instrument_uid in _asset_uids:
+        return _asset_uids[instrument_uid]
     try:
         data = await _call("InstrumentsService", "GetInstrumentBy", {
             "idType": "INSTRUMENT_ID_TYPE_UID",
@@ -979,12 +1037,20 @@ async def _asset_uid(instrument_uid: str) -> str:
         if e.response.status_code == 404:
             return ""
         raise
-    return data.get("instrument", {}).get("assetUid", "")
+    asset_uid = data.get("instrument", {}).get("assetUid", "")
+    if asset_uid:
+        _asset_uids[instrument_uid] = asset_uid
+    return asset_uid
 
 
 async def _asset_uid_for(identifier: str) -> str:
     """Asset UID for a ticker, FIGI, ISIN, instrument UID or asset UID."""
-    uid = await _uid(identifier)
+    uid = await _uid(identifier, figi_ok=False, any_listing=True)
+    if not _is_uid(uid):
+        raise ValueError(
+            f"No instrument matches {identifier!r}. Name it by ticker, FIGI, ISIN or UID; "
+            "find_instrument searches by name"
+        )
     # A UID the instrument lookup does not know is taken to be an asset UID already.
     return await _asset_uid(uid) or uid
 
@@ -1044,7 +1110,7 @@ async def get_consensus_forecasts(
         max_pages: Safety cap on how many pages to scan before giving up (default: 50, at least 1)
     """
     # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
-    uid = await _uid(instrument_id)
+    uid = await _uid(instrument_id, figi_ok=False, any_listing=True)
     asset_uids = {uid, await _asset_uid(uid)} - {""}
     return _fmt(await _consensus_forecast(asset_uids, page_limit, max_pages))
 
@@ -1091,7 +1157,12 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
         "query": ticker,
         "instrumentKind": "INSTRUMENT_TYPE_SHARE",
     })
-    instrument = _pick_instrument(found.get("instruments", []), ticker, class_code)
+    hits = found.get("instruments", [])
+    rivals = _exact([i for i in hits if i.get("apiTradeAvailableFlag")], ticker.strip(), class_code)
+    if len({i.get("isin") for i in rivals}) > 1:
+        names = ", ".join(f"{i.get('ticker')} on {i.get('classCode')} ({i.get('name')})" for i in rivals[:8])
+        return _fmt({"error": f"{ticker!r} names several shares: {names}. Pass class_code to choose one."})
+    instrument = _pick_instrument(hits, ticker, class_code)
     if instrument is None:
         return _fmt({"error": f"No share found for ticker={ticker!r}, class_code={class_code!r}"})
     uid = instrument.get("uid", "")
@@ -1126,9 +1197,12 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     # The change is measured from the close before the first of the last candle_days sessions.
     candles = finished[-(candle_days + 1):]
     price: dict[str, Any] = {}
+    def close(candle: dict) -> int | float | None:
+        return _number(candle["close"]) if candle.get("close") else None
+
     if candles:
-        base_close = _quotation_to_float(candles[0].get("close"))
-        last_close = _quotation_to_float(candles[-1].get("close"))
+        base_close = close(candles[0])
+        last_close = close(candles[-1])
         price["last_close"] = last_close
         if candles[-1].get("time"):
             price["last_close_date"] = candles[-1]["time"][:10]
@@ -1136,7 +1210,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
             price["change_pct"] = round((last_close - base_close) / base_close * 100, 2)
             price["change_sessions"] = len(candles) - 1
     if all_candles and not all_candles[-1].get("isComplete", True):
-        price["current_price"] = _quotation_to_float(all_candles[-1].get("close"))
+        price["current_price"] = close(all_candles[-1])
 
     return _fmt({
         "ticker": instrument.get("ticker"),
@@ -1159,7 +1233,9 @@ async def get_forecast_by(instrument_id: str) -> str:
     Args:
         instrument_id: Instrument ticker, FIGI, ISIN or UID
     """
-    data = await _call("InstrumentsService", "GetForecastBy", {"instrumentId": await _uid(instrument_id)})
+    data = await _call("InstrumentsService", "GetForecastBy", {
+        "instrumentId": await _uid(instrument_id, figi_ok=False, any_listing=True),
+    })
     return _fmt(data)
 
 
@@ -1178,7 +1254,7 @@ async def get_asset_reports(
     """
     now = datetime.now(timezone.utc)
     data = await _call("InstrumentsService", "GetAssetReports", {
-        "instrumentId": await _uid(instrument_id),
+        "instrumentId": await _uid(instrument_id, figi_ok=False, any_listing=True),
         "from": _ts(_parse_date(from_date, now)),
         "to": _ts(_parse_date(to_date, now + timedelta(days=365), end_of_day=True)),
     })
@@ -1287,7 +1363,7 @@ async def get_candles(
 async def _uids(instrument_ids: str) -> list[str]:
     """Instrument UIDs for a comma-separated list of tickers, FIGIs, ISINs or UIDs."""
     given = [i.strip() for i in instrument_ids.split(",") if i.strip()]
-    return list(await asyncio.gather(*(_uid(i) for i in given)))
+    return await _each(given, _uid)
 
 
 @read_only_tool
@@ -1400,7 +1476,7 @@ async def get_tech_analysis(
     interval = INDICATOR_INTERVALS.get(candle_name) or _enum(interval, "INDICATOR_INTERVAL_")
     type_of_price = _enum(type_of_price, "TYPE_OF_PRICE_")
     body: dict[str, Any] = {
-        "instrumentUid": await _uid(instrument_id),
+        "instrumentUid": await _uid(instrument_id, figi_ok=False),
         "indicatorType": indicator_type,
         "from": _ts(_parse_date(from_date, now - timedelta(days=90))),
         "to": _ts(_parse_date(to_date, now, end_of_day=True)),

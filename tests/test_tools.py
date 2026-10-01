@@ -1,5 +1,6 @@
 """Tests for all 39 MCP tool functions — _call is mocked, no real HTTP calls."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -17,9 +18,11 @@ def set_token(monkeypatch):
 @pytest.fixture(autouse=True)
 def forget_resolved_instruments():
     """Identifier lookups are cached for the life of the process; tests must not share them."""
-    srv._resolved.clear()
+    for cache in (srv._resolved, srv._missed, srv._asset_uids):
+        cache.clear()
     yield
-    srv._resolved.clear()
+    for cache in (srv._resolved, srv._missed, srv._asset_uids):
+        cache.clear()
 
 
 def make_call_mock(return_value=None):
@@ -531,34 +534,50 @@ class TestGetBondEvents:
         }
 
 
+ASSET_1 = "40d89385-a03a-4659-bf4e-d3ecba011782"
+ASSET_2 = "bfc8184d-9562-4ea2-87dd-be6e76dc1279"
+ASSET_3 = "cccccccc-1111-2222-3333-444444444444"
+
+
 class TestGetAssetFundamentals:
+    """Asset UIDs given directly: the mock answers {} to the instrument lookup, as the API
+    answers 404 — nothing knows them as instruments, so they are taken to be asset UIDs."""
+
     async def test_single_uid(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_asset_fundamentals("uid1")
+            await srv.get_asset_fundamentals(ASSET_1)
         _, _, body = mock.call_args[0]
-        assert body["assets"] == ["uid1"]
+        assert body["assets"] == [ASSET_1]
 
     async def test_multiple_uids(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_asset_fundamentals("uid1,uid2,uid3")
+            await srv.get_asset_fundamentals(f"{ASSET_1},{ASSET_2},{ASSET_3}")
         _, _, body = mock.call_args[0]
-        assert body["assets"] == ["uid1", "uid2", "uid3"]
+        assert body["assets"] == [ASSET_1, ASSET_2, ASSET_3]
 
     async def test_strips_spaces(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_asset_fundamentals("uid1, uid2 , uid3")
+            await srv.get_asset_fundamentals(f"{ASSET_1}, {ASSET_2} , {ASSET_3}")
         _, _, body = mock.call_args[0]
-        assert body["assets"] == ["uid1", "uid2", "uid3"]
+        assert body["assets"] == [ASSET_1, ASSET_2, ASSET_3]
 
     async def test_filters_empty_strings(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_asset_fundamentals("uid1,,uid2")
+            await srv.get_asset_fundamentals(f"{ASSET_1},,{ASSET_2}")
         _, _, body = mock.call_args[0]
-        assert body["assets"] == ["uid1", "uid2"]
+        assert body["assets"] == [ASSET_1, ASSET_2]
+
+    async def test_something_that_names_no_instrument_is_rejected(self):
+        # Sent on, it would reach the API as an "asset UID" and come back as an empty list.
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="No instrument matches 'NOPE'"):
+                await srv.get_asset_fundamentals("NOPE")
+        assert calls_to(mock, "GetAssetFundamentals") == []
 
 
 def http_error(status_code):
@@ -839,6 +858,18 @@ class TestGetStockSnapshot:
         with patch.object(srv, "_call", mock):
             result = json.loads(await srv.get_stock_snapshot("SBER", class_code="TQBR"))
         assert result["uid"] == "instr-sber"
+
+    async def test_different_shares_under_one_ticker_are_not_picked_between(self):
+        t_tech = {"uid": "instr-t", "ticker": "T", "classCode": "TQBR", "isin": "RU000A107UL4",
+                  "name": "Т-Технологии", "apiTradeAvailableFlag": True}
+        att = {"uid": "instr-att", "ticker": "T", "classCode": "SPBXM", "isin": "US00206R1023",
+               "name": "AT&T", "apiTradeAvailableFlag": True}
+        mock = make_snapshot_call_mock(find_result={"instruments": [att, t_tech]})
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("T"))
+            chosen = json.loads(await srv.get_stock_snapshot("T", class_code="TQBR"))
+        assert "T on TQBR" in result["error"] and "T on SPBXM" in result["error"]
+        assert chosen["uid"] == "instr-t"
 
     async def test_no_instrument_found(self):
         mock = make_snapshot_call_mock(find_result={"instruments": []})
@@ -1401,11 +1432,102 @@ class TestInstrumentResolution:
             assert await srv._uid(SBER["uid"]) == SBER["uid"]
         mock.assert_not_called()
 
-    @pytest.mark.parametrize("identifier", ["SBER", "sber", " SBER ", "BBG004730N88", "RU0009029540"])
-    async def test_ticker_figi_and_isin_resolve_to_the_uid(self, identifier):
+    @pytest.mark.parametrize("identifier", ["SBER", "sber", " SBER ", "RU0009029540"])
+    async def test_ticker_and_isin_resolve_to_the_uid(self, identifier):
         mock = route(FindInstrument=search_results(SBER, SBERP, SBER_OTC))
         with patch.object(srv, "_call", mock):
             assert await srv._uid(identifier) == SBER["uid"]
+
+    @pytest.mark.parametrize("figi", ["BBG004730N88", "TCS00A10DA74"])
+    async def test_figi_goes_through_where_the_api_takes_one(self, figi):
+        # A portfolio's worth of FIGIs in get_last_prices must stay one request, not one each.
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid(figi) == figi
+        mock.assert_not_called()
+
+    async def test_figi_is_resolved_for_uid_only_methods(self):
+        mock = route(FindInstrument=search_results(SBER))
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("BBG004730N88", figi_ok=False) == SBER["uid"]
+            await srv.get_tech_analysis("BBG004730N88", "INDICATOR_TYPE_RSI")
+            await srv.get_forecast_by("BBG004730N88")
+        assert call_body(mock, "GetTechAnalysis")["instrumentUid"] == SBER["uid"]
+        assert call_body(mock, "GetForecastBy")["instrumentId"] == SBER["uid"]
+
+    @pytest.mark.parametrize("not_a_figi", ["RU0009029540", "SU26238RMFS4", "RU000A10DA74"])
+    async def test_isin_and_twelve_character_tickers_are_not_taken_for_figis(self, not_a_figi):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv._uid(not_a_figi)
+        assert calls_to(mock, "FindInstrument") != []
+
+    async def test_a_miss_is_forgotten_after_a_while(self, monkeypatch):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv._uid("NEWCO")
+            monkeypatch.setattr(srv, "MISS_TTL_SECONDS", 0)
+            await srv._uid("NEWCO")
+        assert len(calls_to(mock, "FindInstrument")) == 4  # two searches each time
+
+    async def test_a_name_is_rejected_here_rather_than_sent_to_the_api(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="find_instrument searches by name"):
+                await srv.get_candles("Сбербанк")
+            with pytest.raises(ValueError, match="find_instrument"):
+                await srv.get_candles("Sber Bank")
+        assert calls_to(mock, "GetCandles") == []
+
+    async def test_listing_with_candle_history_is_the_papers_real_board(self):
+        # A fund: four listings of one ISIN, none tradable through the API, one with history.
+        boards = [{**SBER_OTC, "classCode": c, "uid": f"{n}0000000-2222-3333-4444-555555555555"}
+                  for n, c in enumerate(("PTTF", "TQBR", "PTEQ", "TQTF"), start=1)]
+        boards[1]["first1dayCandleDate"] = "2020-08-26T00:00:00Z"
+        mock = route(FindInstrument=search_results(*boards))
+        with patch.object(srv, "_call", mock):
+            await srv.get_candles("SBER")
+            await srv.get_dividends("SBER")
+        assert call_body(mock, "GetCandles")["instrumentId"] == boards[1]["uid"]
+        assert call_body(mock, "GetDividends")["instrumentId"] == boards[1]["uid"]
+
+    async def test_listings_of_one_paper_are_not_an_ambiguity_for_asset_level_tools(self):
+        boards = [{**SBER, "classCode": c, "uid": f"{n}0000000-2222-3333-4444-555555555555"}
+                  for n, c in enumerate(("TQTF", "PTTF", "TQBR"), start=1)]
+        mock = route(FindInstrument=search_results(*boards))
+        with patch.object(srv, "_call", mock):
+            await srv.get_dividends("SBER")
+            with pytest.raises(ValueError, match="SBER_TQTF"):
+                await srv.get_candles("SBER")  # prices do depend on the board
+        assert call_body(mock, "GetDividends")["instrumentId"] == boards[0]["uid"]
+
+    async def test_different_papers_under_one_ticker_stay_an_ambiguity(self):
+        att = {**SBER, "classCode": "SPBXM", "isin": "US00206R1023", "name": "AT&T",
+               "uid": "99999999-2222-3333-4444-555555555555"}
+        mock = route(FindInstrument=search_results(SBER, att))
+        with patch.object(srv, "_call", mock):
+            with pytest.raises(ValueError, match="names 2 instruments"):
+                await srv.get_dividends("SBER")
+
+    async def test_a_long_list_is_looked_up_a_few_at_a_time_and_each_name_once(self):
+        running = peak = 0
+
+        async def find(service, method, body=None):
+            nonlocal running, peak
+            if method == "FindInstrument":
+                running += 1
+                peak = max(peak, running)
+                await asyncio.sleep(0)
+                running -= 1
+            return {}
+
+        tickers = [f"T{n}" for n in range(30)]
+        with patch.object(srv, "_call", AsyncMock(side_effect=find)) as mock:
+            await srv.get_last_prices(",".join(tickers + tickers))
+        assert peak <= srv.LOOKUP_BATCH
+        assert len({b["query"] for b in calls_to(mock, "FindInstrument")}) == 30
+        assert len(calls_to(mock, "FindInstrument")) == 60  # tradable, then all, per distinct name
+        assert len(call_body(mock, "GetLastPrices")["instrumentId"]) == 60
 
     async def test_only_exact_matches_count(self):
         # "SBER" also finds SBERP and every Sber bond; a name is not an identifier.
@@ -1617,6 +1739,14 @@ class TestFindInstrumentShaping:
             result = json.loads(await srv.find_instrument("SBER"))
         assert result["instruments"][0]["forQualInvestorFlag"] is True
 
+    async def test_both_notes_survive_together(self):
+        many = [{**SBER_OTC, "ticker": f"T{n}", "uid": f"uid-{n}"} for n in range(30)]
+        mock = route(FindInstrument=search_results(*many))
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.find_instrument("Сбер", limit=5))
+        assert "not tradable" in result["note"]
+        assert "5 of 30" in result["note"]
+
     async def test_limit_cuts_the_list_and_says_so(self):
         many = [{**SBER, "ticker": f"T{n}", "uid": f"uid-{n}"} for n in range(30)]
         mock = route(FindInstrument=search_results(*many))
@@ -1817,6 +1947,15 @@ class TestAssetFundamentalsIdentifiers:
         with patch.object(srv, "_call", mock):
             await srv.get_asset_fundamentals(f"SBER, {instrument_uid}")
         assert call_body(mock, "GetAssetFundamentals") == {"assets": ["asset-sber", "asset-other"]}
+
+    async def test_asset_of_an_instrument_is_asked_for_once(self):
+        mock = route(FindInstrument=search_results(SBER),
+                     GetInstrumentBy={"instrument": {"assetUid": ASSET_1}})
+        with patch.object(srv, "_call", mock):
+            await srv.get_asset_fundamentals("SBER")
+            await srv.get_asset_fundamentals("SBER")
+            await srv.get_consensus_forecasts("SBER")
+        assert len(calls_to(mock, "GetInstrumentBy")) == 1
 
     async def test_asset_uid_is_kept(self):
         asset_uid = "40d89385-a03a-4659-bf4e-d3ecba011782"

@@ -132,15 +132,8 @@ class TestCallErrorMessage:
         ))
         assert str(error) == (
             "T-Bank API returned HTTP 404 for InstrumentsService/GetInstrumentBy: "
-            "Instrument not found (error code 50002). Name an instrument by ticker, FIGI, ISIN "
-            "or UID; find_instrument searches by name"
+            "Instrument not found (error code 50002)"
         )
-
-    async def test_other_errors_get_no_instrument_hint(self):
-        error = await self._error(httpx.Response(
-            400, json={"code": 3, "message": "`interval` is invalid", "description": "30011"},
-        ))
-        assert str(error).endswith("`interval` is invalid (error code 30011)")
 
     async def test_message_without_code(self):
         error = await self._error(httpx.Response(400, json={"message": "`interval` is invalid"}))
