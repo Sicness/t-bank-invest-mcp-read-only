@@ -28,3 +28,24 @@ jobs:
 
       - name: Run tests
         run: pytest --tb=short -q -x
+
+  # There is no lockfile, so the regular job only ever sees the newest mcp 1.x.
+  # This one keeps the lower bound in pyproject.toml honest.
+  oldest-mcp:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies with the oldest supported mcp
+        run: |
+          floor=$(python -c 'import re, tomllib; deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]; print(next(re.search(r">=([\d.]+)", d).group(1) for d in deps if d.startswith("mcp")))')
+          pip install -e ".[test]" "mcp==$floor"
+
+      - name: Run tests
+        run: pytest --tb=short -q -x
