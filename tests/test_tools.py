@@ -1673,11 +1673,23 @@ class TestInstrumentRef:
             await srv.get_bond_by("anything", id_type="uid")
         assert call_body(mock, "BondBy")["idType"] == "INSTRUMENT_ID_TYPE_UID"
 
-    async def test_unknown_identifier_goes_to_the_api_as_before(self):
+    async def test_figi_goes_to_the_api_without_a_lookup(self):
         mock = route()
         with patch.object(srv, "_call", mock):
             await srv.get_etf_by("BBG000000001")
         assert call_body(mock, "EtfBy") == {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": "BBG000000001"}
+        assert calls_to(mock, "FindInstrument") == []
+
+    async def test_unknown_identifier_goes_to_the_api_as_before(self):
+        mock = route()
+        with patch.object(srv, "_call", mock):
+            await srv.get_etf_by("RU000A0JX0J2")
+        assert call_body(mock, "EtfBy") == {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": "RU000A0JX0J2"}
+
+    async def test_a_name_is_an_error(self):
+        with patch.object(srv, "_call", route()):
+            with pytest.raises(ValueError, match="find_instrument"):
+                await srv.get_share_by("Сбербанк")
 
 
 class TestFindInstrumentShaping:
@@ -1979,6 +1991,18 @@ class TestAssetFundamentalsIdentifiers:
         with patch.object(srv, "_call", mock):
             await srv.get_asset_fundamentals(asset_uid)
         assert call_body(mock, "GetAssetFundamentals") == {"assets": [asset_uid]}
+
+    async def test_an_asset_uid_is_asked_about_once(self):
+        asset_uid = "40d89385-a03a-4659-bf4e-d3ecba011782"
+
+        def not_an_instrument(body):
+            raise http_error(404)
+
+        mock = route(GetInstrumentBy=not_an_instrument)
+        with patch.object(srv, "_call", mock):
+            await srv.get_asset_fundamentals(asset_uid)
+            await srv.get_asset_fundamentals(asset_uid)
+        assert len(calls_to(mock, "GetInstrumentBy")) == 1
 
 
 class TestTechAnalysisNames:

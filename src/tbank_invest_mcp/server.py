@@ -751,11 +751,9 @@ async def find_instrument(
         if found:
             note = "nothing tradable through the API matched; these listings are not tradable"
 
-    wanted = query.strip().upper()
-    def rank(i: dict) -> tuple[bool, bool]:
-        exact = wanted in (i.get(k, "").upper() for k in ("ticker", "figi", "isin"))
-        return (not exact, not i.get("apiTradeAvailableFlag"))
-    found.sort(key=rank)  # stable: the API's own order is kept within each group
+    exact = {i.get("uid") for i in _exact(found, query.strip())}
+    # Stable: the API's own order is kept within each group.
+    found.sort(key=lambda i: (i.get("uid") not in exact, not i.get("apiTradeAvailableFlag")))
 
     instruments = []
     for i in found[:limit]:
@@ -779,8 +777,8 @@ async def _instrument_ref(id: str, id_type: str, class_code: str, kind: str = ""
     """Request fields naming one instrument for the *By methods.
 
     The API wants to be told what kind of identifier it is given and takes a ticker only
-    with its class code. A caller should not have to know either, so a UID is recognised
-    by its shape and anything else is looked up; id_type and class_code still work as before.
+    with its class code. A caller should not have to know either, so the identifier goes
+    through _uid; id_type and class_code still work as before.
     """
     id = id.strip()
     id_type = _enum(id_type or "FIGI", "INSTRUMENT_ID_TYPE_", INSTRUMENT_ID_TYPES)
@@ -791,12 +789,8 @@ async def _instrument_ref(id: str, id_type: str, class_code: str, kind: str = ""
         return {"idType": id_type, "id": id, "classCode": class_code}
     if id_type in ("INSTRUMENT_ID_TYPE_UID", "INSTRUMENT_ID_TYPE_POSITION_UID"):
         return {"idType": id_type, "id": id}
-    if _is_uid(id):
-        return {"idType": "INSTRUMENT_ID_TYPE_UID", "id": id}
-    instrument = await _find_exact(id, kind)
-    if instrument:
-        return {"idType": "INSTRUMENT_ID_TYPE_UID", "id": instrument["uid"]}
-    return {"idType": id_type, "id": id}
+    ref = await _uid(id, kind)
+    return {"idType": "INSTRUMENT_ID_TYPE_UID" if _is_uid(ref) else id_type, "id": ref}
 
 
 @read_only_tool
@@ -1032,7 +1026,8 @@ async def get_asset_fundamentals(assets: str) -> str:
     return _fmt(data)
 
 
-# instrument UID → asset UID; an instrument stays with its asset.
+# instrument UID → asset UID, or "" for a UID that is not an instrument's (an asset UID is
+# passed here too); neither ever changes.
 _asset_uids: dict[str, str] = {}
 
 
@@ -1050,12 +1045,11 @@ async def _asset_uid(instrument_uid: str) -> str:
             "id": instrument_uid,
         })
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return ""
-        raise
+        if e.response.status_code != 404:
+            raise
+        data = {}
     asset_uid = data.get("instrument", {}).get("assetUid", "")
-    if asset_uid:
-        _asset_uids[instrument_uid] = asset_uid
+    _asset_uids[instrument_uid] = asset_uid
     return asset_uid
 
 
@@ -1071,15 +1065,14 @@ async def _asset_uid_for(identifier: str) -> str:
     return await _asset_uid(uid) or uid
 
 
-async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
-    """Scan GetConsensusForecasts pages for the item whose assetUid is in asset_uids.
+async def _consensus_forecast(asset_uid: str, page_limit: int = 100, max_pages: int = 50) -> dict:
+    """Scan GetConsensusForecasts pages for the item of asset_uid.
 
     Returns the item, or {"error": ...} saying whether the whole list was scanned or the
     scan was cut short by max_pages.
     """
-    if not asset_uids:
+    if not asset_uid:
         return {"error": "No asset UID to look a consensus forecast up by"}
-    label = " / ".join(sorted(asset_uids))
     if page_limit < 1:
         # What the API itself does with a non-positive limit; say so in the request, because
         # clamping to 1 would turn the scan into a request per item.
@@ -1092,16 +1085,16 @@ async def _consensus_forecast(asset_uids: set[str], page_limit: int = 100, max_p
         items = data.get("items", [])
         for item in items:
             # An item's own "uid" identifies the forecast record, not the instrument.
-            if item.get("assetUid") in asset_uids:
+            if item.get("assetUid") == asset_uid:
                 return item
 
         # Counted from what actually came back, not from the page size that was asked for.
         seen += len(items)
         if not items or seen >= data.get("page", {}).get("totalCount", 0):
-            return {"error": f"No consensus forecast found for asset {label}"}
+            return {"error": f"No consensus forecast found for asset {asset_uid}"}
 
     return {"error": (
-        f"No consensus forecast found for asset {label} in the first {max_pages} pages; "
+        f"No consensus forecast found for asset {asset_uid} in the first {max_pages} pages; "
         "the scan stopped at max_pages before reaching the end of the list — raise max_pages"
     )}
 
@@ -1125,22 +1118,17 @@ async def get_consensus_forecasts(
         page_limit: Page size used while scanning (default: 100; a non-positive value means 100)
         max_pages: Safety cap on how many pages to scan before giving up (default: 50, at least 1)
     """
-    # instrument_id itself stays in the set: it is already an asset UID if the lookup found nothing.
+    # A UID the instrument lookup does not know is taken to be an asset UID already.
     uid = await _uid(instrument_id, figi_ok=False, any_listing=True)
-    asset_uids = {uid, await _asset_uid(uid)} - {""}
-    return _fmt(await _consensus_forecast(asset_uids, page_limit, max_pages))
+    asset_uid = await _asset_uid(uid) or uid
+    return _fmt(await _consensus_forecast(asset_uid, page_limit, max_pages))
 
 
 def _pick_instrument(instruments: list[dict], query: str, class_code: str = "") -> dict | None:
     """Choose one FindInstrument hit: an exact ticker/ISIN/FIGI match beats search order."""
     if class_code:
-        instruments = [i for i in instruments if i.get("classCode") == class_code]
-    q = query.strip().upper()
-    exact = [
-        i for i in instruments
-        if q in (i.get("ticker", "").upper(), i.get("isin", "").upper(), i.get("figi", "").upper())
-    ]
-    candidates = exact or instruments
+        instruments = [i for i in instruments if i.get("classCode", "").upper() == class_code.upper()]
+    candidates = _exact(instruments, query.strip()) or instruments
     return next((i for i in candidates if i.get("apiTradeAvailableFlag")), next(iter(candidates), None))
 
 
@@ -1198,7 +1186,7 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
             "to": _ts(now),
             "interval": "CANDLE_INTERVAL_DAY",
         }),
-        _consensus_forecast({asset_uid} - {""}),
+        _consensus_forecast(asset_uid),
     )
 
     # Today's candle is unfinished while the session is open: its "close" is the price right

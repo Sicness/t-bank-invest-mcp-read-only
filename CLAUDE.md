@@ -52,9 +52,9 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 | `_find_exact(identifier, kind, any_listing)` / `_uid(identifier, kind, figi_ok=, any_listing=)` | the instrument a ticker, FIGI, ISIN or `TICKER_CLASSCODE` names (hits cached in `_resolved`, misses for `MISS_TTL_SECONDS` in `_missed`; `ValueError` if several match), and what to send the API for it — its UID, a FIGI as is where the method takes one, or the identifier unchanged if nothing matches |
 | `_csv(values)` / `_each(identifiers, resolve)` / `_uids(csv)` | split a comma-separated parameter; resolve a list: each distinct identifier once, `LOOKUP_BATCH` at a time |
 | `_asset_uid_for(identifier)` / `_instrument_ref(id, id_type, class_code, kind)` | the same for asset-UID methods (instrument → asset cached in `_asset_uids`), and for the `*By` methods' `{idType, id, classCode}` |
-| `_asset_uid(instrument_uid)` | instrument UID → asset UID via `GetInstrumentBy`; `""` on 404 |
-| `_consensus_forecast(asset_uids, ...)` | pages through `GetConsensusForecasts` to find one asset's item |
-| `_pick_instrument(instruments, query, class_code)` | chooses one `FindInstrument` hit |
+| `_asset_uid(instrument_uid)` | instrument UID → asset UID via `GetInstrumentBy`; `""` on 404; either answer cached in `_asset_uids` |
+| `_consensus_forecast(asset_uid, ...)` | pages through `GetConsensusForecasts` to find one asset's item |
+| `_pick_instrument(instruments, query, class_code)` | chooses one `FindInstrument` hit for `get_stock_snapshot`, whose query may be a name |
 
 **TLS.** T-API is served under Russian Ministry of Digital Development (НУЦ Минцифры) certificates, absent from every default trust store. `certs/russian_trusted_root_ca.pem` is pinned for this client only — never install it system-wide, since that CA could then impersonate any host. `_ssl_context()` checks the file's SHA-256 against `CA_SHA256` and refuses to run if it differs; `TBANK_CA_BUNDLE` overrides the bundle if the CA rotates.
 
