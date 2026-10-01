@@ -32,10 +32,13 @@ No test suite, linter, or formatter is currently configured.
 
 Single-file implementation in `src/tbank_invest_mcp/server.py` (~800 lines).
 
-**Core pattern**: Each tool is an async function decorated with `@mcp.tool()` that calls `_call(service, method, body)` → HTTP POST to `https://invest-public-api.tinkoff.ru/rest/tinkoff.public.invest.api.contract.v1.{Service}/{Method}`.
+**Core pattern**: Each tool is an async function decorated with `@mcp.tool()` that calls `_call(service, method, body)` → HTTP POST to `https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.{Service}/{Method}`.
+
+**TLS**: T-API is served under Russian Ministry of Digital Development (НУЦ Минцифры) certificates, absent from every default trust store. `certs/russian_trusted_root_ca.pem` is pinned for this client only — never install it system-wide, since that CA could then impersonate any host. `_ssl_context()` checks the file's SHA-256 against `CA_SHA256` and refuses to run if it differs; `TBANK_CA_BUNDLE` overrides the bundle if the CA rotates.
 
 **Internal helpers**:
 - `_get_token()` / `_headers()` — auth via `TBANK_INVEST_TOKEN` env var (Bearer token)
+- `_ssl_context()` / `_get_client()` — pinned-CA context, one shared `AsyncClient`
 - `_call(service, method, body)` — async POST with httpx, 30s timeout
 - `_ts(dt)` / `_parse_date(s)` — datetime ↔ RFC 3339 conversion
 - `_fmt(data)` — JSON serialization with `ensure_ascii=False`

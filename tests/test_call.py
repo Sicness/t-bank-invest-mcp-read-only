@@ -5,12 +5,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from tbank_invest_mcp import server
 from tbank_invest_mcp.server import BASE_URL, SERVICE_PREFIX, _call
 
 
 @pytest.fixture(autouse=True)
 def set_token(monkeypatch):
     monkeypatch.setenv("TBANK_INVEST_TOKEN", "test-token")
+
+
+@pytest.fixture(autouse=True)
+def reset_client():
+    """_call() reuses one module-level client; drop it so each test gets its mock."""
+    server._client = None
+    yield
+    server._client = None
 
 
 def _make_mock_response(data: dict, status_code: int = 200):
