@@ -1808,7 +1808,7 @@ class TestPortfolioShaping:
         assert result["positions"] == [{
             "currency": "rub",
             "figi": "BBG004730N88", "instrumentType": "share", "ticker": "SBER", "classCode": "TQBR",
-            "instrumentUid": SBER["uid"], "positionUid": SBER["positionUid"],
+            "instrumentUid": SBER["uid"],
             "quantity": 100,
             "averagePositionPrice": 270.1, "averagePositionPriceFifo": 269,
             "currentPrice": 274.27,
@@ -1828,31 +1828,48 @@ class TestPortfolioShaping:
             "money": [money(1500, 500000000), money(20, currency="usd")],
             "blocked": [],
             "securities": [{"figi": "F", "blocked": "0", "balance": "10", "exchangeBlocked": False,
-                            "instrumentType": "share", "ticker": "SBER"}],
+                            "instrumentType": "share", "ticker": "SBER", "positionUid": "p-1",
+                            "instrumentUid": "i-1"}],
             "limitsLoadingInProgress": False,
             "futures": [], "options": [], "accountId": "acc1",
         }
         with patch.object(srv, "_call", make_call_mock(data)):
             result = json.loads(await srv.get_positions("acc1"))
         assert result["money"] == [{"value": 1500.5, "currency": "rub"}, {"value": 20, "currency": "usd"}]
-        assert result["securities"] == [{"figi": "F", "balance": "10", "instrumentType": "share", "ticker": "SBER"}]
+        assert result["securities"] == [
+            {"figi": "F", "balance": "10", "instrumentType": "share", "ticker": "SBER", "instrumentUid": "i-1"},
+        ]
         assert result["limitsLoadingInProgress"] is False  # only list items are trimmed
 
     async def test_operations_trimmed(self):
         item = {"id": "1", "type": "OPERATION_TYPE_BUY", "payment": money(-27410), "price": money(274, 100000000),
                 "commission": money(-13, -700000000), "yield": money(0), "accruedInt": money(0),
                 "yieldRelative": quotation(0), "quantity": "100", "quantityRest": "0", "cancelReason": "",
-                "tradesInfo": {"trades": []}, "childOperations": []}
+                "tradesInfo": {"trades": []}, "childOperations": [],
+                # what the request or another field already says
+                "cursor": "c-1", "brokerAccountId": "acc1", "instrumentKind": "INSTRUMENT_TYPE_SHARE",
+                "operationType": "OPERATION_TYPE_BUY", "positionUid": "p-1", "assetUid": "a-1",
+                "instrumentUid": "i-1", "instrumentType": "share"}
         with patch.object(srv, "_call", make_call_mock({"hasNext": False, "nextCursor": "", "items": [item]})):
             result = json.loads(await srv.get_operations_by_cursor("acc1"))
         assert result["items"] == [{
             "currency": "rub", "id": "1", "type": "OPERATION_TYPE_BUY", "payment": -27410, "price": 274.1,
             "commission": -13.7, "quantity": "100", "tradesInfo": {"trades": []},
+            "instrumentUid": "i-1", "instrumentType": "share",
         }]
         with patch.object(srv, "_call", make_call_mock({"operations": [item]})):
             result = json.loads(await srv.get_operations("acc1"))
         assert result["operations"][0]["payment"] == -27410
         assert "yield" not in result["operations"][0]
+        assert not {"operationType", "positionUid", "assetUid"} & result["operations"][0].keys()
+        assert result["operations"][0]["type"] == "OPERATION_TYPE_BUY"
+
+    async def test_operations_page_defaults_to_fifty(self):
+        # A hundred real operations is 68k characters: more than a client lets through.
+        mock = make_call_mock({"items": []})
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations_by_cursor("acc1")
+        assert mock.call_args[0][2]["limit"] == 50
 
     async def test_bond_events_trimmed(self):
         event = {"instrumentId": "uid", "eventNumber": 12, "eventDate": "2026-12-02T00:00:00Z",

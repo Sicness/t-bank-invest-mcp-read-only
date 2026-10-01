@@ -536,7 +536,8 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
 
     Each position has ticker, classCode, figi, instrumentUid, instrumentType, quantity,
     averagePositionPrice, currentPrice, expectedYield, dailyYield, currentNkd (bonds) and its
-    `currency`. Amounts are plain numbers; a field that is zero or false is left out.
+    `currency`. Amounts are plain numbers; a field that is zero or false is left out, and so
+    are positionUid and the two fields the API has deprecated.
 
     Args:
         account_id: Account ID (get from get_accounts)
@@ -548,9 +549,11 @@ async def get_portfolio(account_id: str, currency: PortfolioCurrency = "RUB") ->
         raise ValueError(f"currency must be one of {', '.join(currency_map)}, got {currency!r}")
     body: dict[str, Any] = {"accountId": account_id, "currency": currency_map[code]}
     data = await _call("OperationsService", "GetPortfolio", body)
-    # The two dropped fields are deprecated in the API contract.
+    # averagePositionPricePt and quantityLots are deprecated in the API contract. positionUid
+    # is a second identifier of what instrumentUid already names, and a seventh of the size.
     return _json(_trimmed(
-        data, "positions", "virtualPositions", drop=("averagePositionPricePt", "quantityLots"),
+        data, "positions", "virtualPositions",
+        drop=("averagePositionPricePt", "quantityLots", "positionUid"),
     ))
 
 
@@ -559,13 +562,14 @@ async def get_positions(account_id: str) -> str:
     """Get all positions in an account: securities, futures, options, and cash balances.
 
     Unlike get_portfolio, this returns raw position balances without price calculations.
-    A field that is zero or false (blocked, exchangeBlocked) is left out.
+    A field that is zero or false (blocked, exchangeBlocked) is left out, and so is
+    positionUid; instrumentUid identifies the instrument.
 
     Args:
         account_id: Account ID (get from get_accounts)
     """
     data = await _call("OperationsService", "GetPositions", {"accountId": account_id})
-    return _json(_trimmed(data, "securities", "futures", "options"))
+    return _json(_trimmed(data, "securities", "futures", "options", drop=("positionUid",)))
 
 
 @read_only_tool
@@ -582,6 +586,12 @@ async def get_withdraw_limits(account_id: str) -> str:
 # ── Operations ───────────────────────────────────────────────────────────────
 
 OPERATION_STATES = ("EXECUTED", "CANCELED", "PROGRESS")
+# Fields of an operation that say again what another field or the request already says:
+# the operation type and the instrument under a second name, the account that was asked
+# for, a per-item cursor next to the page's nextCursor. A third of every item.
+_OPERATION_REPEATS = (
+    "operationType", "instrumentKind", "positionUid", "assetUid", "brokerAccountId", "cursor",
+)
 
 
 @read_only_tool
@@ -596,9 +606,11 @@ async def get_operations(
 
     Returns: buys, sells, dividends, coupons, taxes, commissions, deposits, withdrawals, etc.
     Each operation has: id, type, date, payment amount, instrument info, quantity, trades.
-    A field that is zero or empty is left out.
+    A field that is zero or empty is left out, and so are fields that repeat another one
+    (operationType repeats type; positionUid and assetUid name what instrumentUid names).
 
-    Note: for large histories use get_operations_by_cursor instead.
+    Note: this method has no paging and an active account has hundreds of operations a
+    year — keep the range to a month or two, or use get_operations_by_cursor.
 
     Args:
         account_id: Account ID
@@ -623,7 +635,7 @@ async def get_operations(
         instrument = None if _FIGI_RE.fullmatch(figi) else await _find_exact(figi)
         body["figi"] = (instrument or {}).get("figi") or figi
     data = await _call("OperationsService", "GetOperations", body)
-    return _json(_trimmed(data, "operations"))
+    return _json(_trimmed(data, "operations", drop=_OPERATION_REPEATS))
 
 
 @read_only_tool
@@ -632,7 +644,7 @@ async def get_operations_by_cursor(
     from_date: str = "",
     to_date: str = "",
     cursor: str = "",
-    limit: int = 100,
+    limit: int = 50,
     instrument_id: str = "",
     operation_types: str = "",
     state: OperationState = "",
@@ -641,9 +653,11 @@ async def get_operations_by_cursor(
 ) -> str:
     """Get operations with cursor-based pagination. Better for large histories.
 
-    Returns hasNext and nextCursor for pagination. Each operation item includes
-    detailed info: payment, price, commission, yield, quantity, trades, ticker.
-    A field that is zero or empty is left out.
+    Returns hasNext and nextCursor for pagination: pass nextCursor as cursor to get the
+    next page. Each operation item includes detailed info: payment, price, commission,
+    yield, quantity, trades, ticker. A field that is zero or empty is left out, and so are
+    fields that repeat another one or the request (instrumentKind, positionUid, assetUid,
+    brokerAccountId, the per-item cursor).
 
     Common operation types: BUY, SELL, DIVIDEND, COUPON, TAX, BOND_TAX, INPUT, OUTPUT,
     BROKER_FEE, BOND_REPAYMENT_FULL, BOND_REPAYMENT.
@@ -653,7 +667,8 @@ async def get_operations_by_cursor(
         from_date: Start date (YYYY-MM-DD), default: 1 year ago
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         cursor: Cursor from previous response for pagination
-        limit: Number of operations per page (1-1000, default: 100)
+        limit: Number of operations per page (1-1000, default: 50; a page of 50 is about
+            25,000 characters, and a client refuses a result several times that)
         instrument_id: Filter by instrument — ticker, FIGI, ISIN or UID
         operation_types: Comma-separated operation types (e.g. "BUY,SELL,DIVIDEND")
         state: Filter by state: EXECUTED, CANCELED, PROGRESS
@@ -682,7 +697,7 @@ async def get_operations_by_cursor(
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
-    return _json(_trimmed(data, "items"))
+    return _json(_trimmed(data, "items", drop=_OPERATION_REPEATS))
 
 
 # ── Instruments ──────────────────────────────────────────────────────────────
