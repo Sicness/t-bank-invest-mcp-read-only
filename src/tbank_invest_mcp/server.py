@@ -537,6 +537,31 @@ async def get_asset_fundamentals(assets: str) -> str:
     return _fmt(data)
 
 
+async def _consensus_forecast(ids: set[str], page_limit: int = 100, max_pages: int = 50) -> dict:
+    """Scan GetConsensusForecasts pages for the item whose uid or assetUid is in ids.
+
+    Returns the item, or {"error": ...} saying whether the whole list was scanned or the
+    scan was cut short by max_pages.
+    """
+    label = " / ".join(sorted(ids))
+    for page_number in range(max_pages):
+        data = await _call("InstrumentsService", "GetConsensusForecasts", {
+            "paging": {"limit": page_limit, "pageNumber": page_number},
+        })
+        for item in data.get("items", []):
+            if item.get("uid") in ids or item.get("assetUid") in ids:
+                return item
+
+        total_count = data.get("page", {}).get("totalCount", 0)
+        if (page_number + 1) * page_limit >= total_count:
+            return {"error": f"No consensus forecast found for {label}"}
+
+    return {"error": (
+        f"No consensus forecast found for {label} in the first {max_pages} pages; "
+        "the scan stopped at max_pages before reaching the end of the list — raise max_pages"
+    )}
+
+
 @mcp.tool()
 async def get_consensus_forecasts(
     instrument_id: str,
@@ -548,80 +573,106 @@ async def get_consensus_forecasts(
 
     GetConsensusForecasts has no server-side instrument filter — it only returns pages of
     forecasts for the whole instrument universe. This scans pages internally and returns
-    just the item matching instrument_id.
+    just the item matching instrument_id, or {"error": ...} if there is none.
 
     Args:
-        instrument_id: Instrument UID (matched against each item's asset_uid)
+        instrument_id: Instrument UID or asset UID (matched against each item's uid and asset_uid)
         page_limit: Page size used while scanning (default: 100)
         max_pages: Safety cap on how many pages to scan before giving up (default: 50)
     """
-    page_number = 0
-    while page_number < max_pages:
-        data = await _call("InstrumentsService", "GetConsensusForecasts", {
-            "paging": {"limit": page_limit, "pageNumber": page_number},
-        })
-        items = data.get("items", [])
-        match = next((item for item in items if item.get("assetUid") == instrument_id), None)
-        if match is not None:
-            return _fmt(match)
+    return _fmt(await _consensus_forecast({instrument_id}, page_limit, max_pages))
 
-        total_count = data.get("page", {}).get("totalCount", 0)
-        page_number += 1
-        if page_number * page_limit >= total_count:
-            break
 
-    return _fmt({"error": f"No consensus forecast found for instrument_id={instrument_id!r}"})
+def _pick_instrument(instruments: list[dict], query: str, class_code: str = "") -> dict | None:
+    """Choose one FindInstrument hit: an exact ticker/ISIN/FIGI match beats search order."""
+    if class_code:
+        instruments = [i for i in instruments if i.get("classCode") == class_code]
+    q = query.strip().upper()
+    exact = [
+        i for i in instruments
+        if q in (i.get("ticker", "").upper(), i.get("isin", "").upper(), i.get("figi", "").upper())
+    ]
+    candidates = exact or instruments
+    return next((i for i in candidates if i.get("apiTradeAvailableFlag")), next(iter(candidates), None))
 
 
 @mcp.tool()
-async def get_stock_snapshot(ticker: str, candle_days: int = 5) -> str:
-    """Get a one-call overview of a stock: fundamentals, recent price change, and analyst consensus.
+async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str = "") -> str:
+    """Get a one-call overview of a share: fundamentals, recent price change, and analyst consensus.
 
-    Convenience wrapper around FindInstrument + GetAssetFundamentals + GetCandles +
-    GetConsensusForecasts, so a caller doesn't need 3-4 separate round trips (and the manual
-    ticker-to-UID resolution step) just to get a compact picture of one instrument.
+    Convenience wrapper around FindInstrument + GetInstrumentBy + GetAssetFundamentals +
+    GetCandles + GetConsensusForecasts, so a caller doesn't need separate round trips (and
+    the manual ticker → UID → asset UID resolution) to get a compact picture of one share.
+
+    Returns ticker, class_code, uid, asset_uid and name of the share it resolved to — check
+    them when the query is ambiguous — plus price {last_close, change_pct, change_sessions},
+    fundamentals and consensus. Returns {"error": ...} if no share matches.
 
     Args:
-        ticker: Ticker, name, ISIN, or FIGI to look up (passed to FindInstrument)
-        candle_days: How many days of daily candles to use for the price summary (default: 5)
+        ticker: Ticker, name, ISIN, or FIGI of a share (searched with FindInstrument; an exact
+            ticker/ISIN/FIGI match is preferred over the first search hit)
+        candle_days: Number of daily candles (trading sessions) the price change spans (default: 5)
+        class_code: Optional class code to disambiguate listings (e.g. "TQBR")
     """
-    found = await _call("InstrumentsService", "FindInstrument", {"query": ticker})
-    instruments = found.get("instruments", [])
-    if not instruments:
-        return _fmt({"error": f"No instrument found for ticker={ticker!r}"})
-    instrument = instruments[0]
+    if candle_days < 1:
+        raise ValueError(f"candle_days must be at least 1, got {candle_days}")
+
+    found = await _call("InstrumentsService", "FindInstrument", {
+        "query": ticker,
+        "instrumentKind": "INSTRUMENT_TYPE_SHARE",
+    })
+    instrument = _pick_instrument(found.get("instruments", []), ticker, class_code)
+    if instrument is None:
+        return _fmt({"error": f"No share found for ticker={ticker!r}, class_code={class_code!r}"})
     uid = instrument.get("uid", "")
 
+    # Fundamentals and consensus forecasts are keyed by asset UID, which FindInstrument omits.
+    details = await _call("InstrumentsService", "GetInstrumentBy", {
+        "idType": "INSTRUMENT_ID_TYPE_UID",
+        "id": uid,
+    })
+    asset_uid = details.get("instrument", {}).get("assetUid", "")
+
+    async def fundamentals_for_asset() -> dict:
+        if not asset_uid:
+            return {}
+        data = await _call("InstrumentsService", "GetAssetFundamentals", {"assets": [asset_uid]})
+        return next(iter(data.get("fundamentals", [])), {})
+
     now = datetime.now(timezone.utc)
-    fundamentals_data, candles_data, consensus_raw = await asyncio.gather(
-        _call("InstrumentsService", "GetAssetFundamentals", {"assets": [uid]}),
+    fundamentals, candles_data, consensus = await asyncio.gather(
+        fundamentals_for_asset(),
         _call("MarketDataService", "GetCandles", {
             "instrumentId": uid,
-            "from": _ts(now - timedelta(days=candle_days)),
+            # Calendar window wide enough to hold candle_days + 1 sessions across
+            # weekends and long holidays.
+            "from": _ts(now - timedelta(days=candle_days * 3 // 2 + 14)),
             "to": _ts(now),
             "interval": "CANDLE_INTERVAL_DAY",
         }),
-        get_consensus_forecasts(uid),
+        _consensus_forecast({i for i in (uid, asset_uid) if i}),
     )
 
-    fundamentals = next(iter(fundamentals_data.get("fundamentals", [])), {})
-    candles = candles_data.get("candles", [])
-
+    # The change is measured from the close before the first of the last candle_days sessions.
+    candles = candles_data.get("candles", [])[-(candle_days + 1):]
     price: dict[str, Any] = {}
     if candles:
-        first_close = _quotation_to_float(candles[0].get("close"))
+        base_close = _quotation_to_float(candles[0].get("close"))
         last_close = _quotation_to_float(candles[-1].get("close"))
         price["last_close"] = last_close
-        if first_close:
-            price[f"change_{candle_days}d_pct"] = round((last_close - first_close) / first_close * 100, 2)
+        if len(candles) > 1 and base_close and last_close is not None:
+            price["change_pct"] = round((last_close - base_close) / base_close * 100, 2)
+            price["change_sessions"] = len(candles) - 1
 
     return _fmt({
-        "ticker": ticker,
+        "ticker": instrument.get("ticker"),
+        "class_code": instrument.get("classCode"),
         "uid": uid,
+        "asset_uid": asset_uid,
         "name": instrument.get("name"),
         "price": price,
         "fundamentals": fundamentals,
-        "consensus": json.loads(consensus_raw),
+        "consensus": consensus,
     })
 
 
