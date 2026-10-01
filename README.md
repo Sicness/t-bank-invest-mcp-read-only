@@ -16,34 +16,41 @@ MCP-сервер для работы с инвестиционным портф�
 
 ## Требования
 
-- Python 3.11+
-- Токен T-Bank Invest API — получить на [tbank.ru/invest/settings/api](https://www.tbank.ru/invest/settings/api/)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) — запускает сервер одной командой: сам подбирает Python 3.11+ и ставит зависимости в изолированное окружение
+- Токен T-Invest API — выпустить на [tbank.ru/invest/settings/api](https://www.tbank.ru/invest/settings/api/)
 
-## Установка
+### Какой токен выпускать
+
+Выпускайте токен **только для чтения** (readonly). Сервер вызывает только методы чтения, права на сделки ему не нужны, а с таким токеном торговые поручения невозможны уже на стороне Т-Банка — это вторая линия защиты помимо кода сервера. Токен можно дополнительно ограничить одним счётом.
+
+MCP-клиенты хранят токен в своей конфигурации открытым текстом — ещё одна причина не давать ему прав на сделки.
+
+## Подключение
+
+Клонировать репозиторий не нужно: `uvx` скачает и запустит сервер сам. Токен передаётся через переменную окружения `TBANK_INVEST_TOKEN` в конфигурации MCP-клиента.
+
+### Claude Code
 
 ```bash
-git clone <repository-url>
-cd t-bank-invest-mcp-read-only
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+claude mcp add t-bank-invest -e TBANK_INVEST_TOKEN=your_token_here -- uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only
 ```
 
-## Использование
+По умолчанию сервер подключается только к текущему проекту; чтобы он был доступен во всех проектах, добавьте `--scope user`. С `--scope project` конфигурация вместе с токеном записывается в `.mcp.json` в корне проекта — не коммитьте этот файл.
 
-Токен передаётся через переменную окружения `TBANK_INVEST_TOKEN`. Сервер **не** загружает `.env` файл автоматически — переменную нужно экспортировать в shell или передать через конфигурацию MCP-клиента.
+### Claude Desktop
 
-### Claude Desktop / Claude Code
-
-Добавьте в конфигурацию MCP-клиента:
-- **Claude Desktop** (macOS): `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Claude Code**: `.claude/settings.json` проекта или глобальные настройки
+Добавьте сервер в `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`) и перезапустите приложение:
 
 ```json
 {
   "mcpServers": {
     "t-bank-invest": {
-      "command": "/path/to/t-bank-invest-mcp-read-only/.venv/bin/t-bank-invest-mcp-read-only",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Sicness/t-bank-invest-mcp-read-only",
+        "t-bank-invest-mcp-read-only"
+      ],
       "env": {
         "TBANK_INVEST_TOKEN": "your_token_here"
       }
@@ -52,12 +59,44 @@ pip install -e .
 }
 ```
 
+Если Claude Desktop не находит `uvx`, укажите в `command` полный путь к нему (его покажет `which uvx`).
+
+### Другие MCP-клиенты
+
+Сервер работает по stdio. В любом клиенте укажите ту же команду, те же аргументы и переменную окружения, что в примере для Claude Desktop.
+
+### Конкретная версия
+
+Без уточнения ставится текущее состояние ветки `main`. Чтобы закрепить версию, допишите к адресу тег со страницы [релизов](https://github.com/Sicness/t-bank-invest-mcp-read-only/releases), например:
+
+```
+git+https://github.com/Sicness/t-bank-invest-mcp-read-only@v1.0.0
+```
+
+### Установка из исходников
+
+Для разработки или если `uv` не подходит:
+
+```bash
+git clone https://github.com/Sicness/t-bank-invest-mcp-read-only.git
+cd t-bank-invest-mcp-read-only
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test]"
+```
+
+В конфигурации MCP-клиента тогда указывается полный путь к команде: `/path/to/t-bank-invest-mcp-read-only/.venv/bin/t-bank-invest-mcp-read-only`, без `args`.
+
 ### Запуск напрямую
+
+Сервер **не** загружает `.env` файл — переменную нужно экспортировать в shell:
 
 ```bash
 export TBANK_INVEST_TOKEN=your_token_here
-t-bank-invest-mcp-read-only
+uvx --from git+https://github.com/Sicness/t-bank-invest-mcp-read-only t-bank-invest-mcp-read-only
 ```
+
+Из установленного окружения то же самое делает команда `t-bank-invest-mcp-read-only` или `python -m tbank_invest_mcp`.
 
 ## Доступные инструменты
 
