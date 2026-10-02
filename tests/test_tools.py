@@ -799,14 +799,32 @@ class TestGetStockSnapshot:
         assert result["price"] == {"last_close": 110.0, "change_pct": 10.0, "change_sessions": 1}
         assert result["consensus"]["consensus"] == "RECOMMENDATION_BUY"
 
-    async def test_searches_shares_only(self):
+    async def test_searches_tradable_shares_and_stops_when_the_ticker_is_among_them(self):
+        # The full list for a one-letter ticker (T) is megabytes the API may fail to send.
         mock = make_snapshot_call_mock()
         with patch.object(srv, "_call", mock):
             await srv.get_stock_snapshot("SBER")
-        assert call_body(mock, "FindInstrument") == {
-            "query": "SBER",
-            "instrumentKind": "INSTRUMENT_TYPE_SHARE",
-        }
+        assert calls_to(mock, "FindInstrument") == [{
+            "query": "SBER", "instrumentKind": "INSTRUMENT_TYPE_SHARE", "apiTradeAvailableFlag": True,
+        }]
+
+    async def test_a_share_not_tradable_through_the_api_is_still_found(self):
+        blocked = {"uid": "instr-sber", "ticker": "SBER", "classCode": "SPEQ", "name": "Сбербанк"}
+        mock = route(
+            FindInstrument=lambda body: {"instruments": [] if body.get("apiTradeAvailableFlag") else [blocked]},
+            GetInstrumentBy={"instrument": {"uid": "instr-sber", "assetUid": "asset-sber"}},
+        )
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("SBER"))
+        assert result["class_code"] == "SPEQ"
+        assert len(calls_to(mock, "FindInstrument")) == 2
+
+    async def test_a_name_is_taken_from_the_tradable_matches(self):
+        mock = make_snapshot_call_mock()
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_stock_snapshot("Сбербанк"))
+        assert result["ticker"] == "SBER"
+        assert len(calls_to(mock, "FindInstrument")) == 1
 
     async def test_candles_by_instrument_uid_fundamentals_by_asset_uid(self):
         mock = make_snapshot_call_mock()
@@ -880,7 +898,7 @@ class TestGetStockSnapshot:
         with patch.object(srv, "_call", mock):
             result = json.loads(await srv.get_stock_snapshot("NOPE"))
         assert "error" in result
-        assert mock.await_count == 1
+        assert [c[0][1] for c in mock.call_args_list] == ["FindInstrument", "FindInstrument"]
 
     async def test_no_candles_returns_empty_price(self):
         mock = make_snapshot_call_mock(candles={"candles": []})
@@ -1617,6 +1635,42 @@ class TestInstrumentResolution:
         mock = route(FindInstrument=answer)
         with patch.object(srv, "_call", mock):
             assert await srv._uid("SBER_SMAL") == other_board["uid"]
+
+    async def test_ticker_with_class_code_is_asked_for_directly(self):
+        # Real case: T_TQBR. A search for "T" is 1.7 MB at best and fails when the API is
+        # busy; GetInstrumentBy finds a ticker on its board exactly.
+        t_share = {**SBER, "ticker": "T", "instrumentKind": "INSTRUMENT_TYPE_SHARE"}
+        mock = route(GetInstrumentBy={"instrument": t_share})
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("t_tqbr") == SBER["uid"]
+        assert calls_to(mock, "FindInstrument") == [{"query": "t_tqbr"}]  # the plain reading only
+        assert calls_to(mock, "GetInstrumentBy") == [
+            {"idType": "INSTRUMENT_ID_TYPE_TICKER", "id": "t", "classCode": "TQBR"},
+        ]
+
+    async def test_ticker_with_class_code_is_tried_in_upper_case(self):
+        def by_ticker(body):
+            if body["id"] != "SBER":
+                raise http_error(404)
+            return {"instrument": SBER}
+
+        mock = route(GetInstrumentBy=by_ticker)
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("sber_tqbr") == SBER["uid"]
+        assert [b["id"] for b in calls_to(mock, "GetInstrumentBy")] == ["sber", "SBER"]
+
+    async def test_ticker_with_class_code_of_another_kind_is_not_taken(self):
+        mock = route(GetInstrumentBy={"instrument": SBER})  # a share, where a bond is wanted
+        with patch.object(srv, "_call", mock):
+            assert await srv._uid("SBER_TQBR", "bond") == "SBER_TQBR"
+
+    async def test_other_errors_of_the_direct_lookup_are_not_swallowed(self):
+        def failing(body):
+            raise http_error(500)
+
+        with patch.object(srv, "_call", route(GetInstrumentBy=failing)):
+            with pytest.raises(httpx.HTTPStatusError):
+                await srv._uid("SBER_TQBR")
 
     async def test_ticker_that_contains_an_underscore(self):
         cny = {"ticker": "CNYRUB_TOM", "classCode": "CETS", "uid": "4587ab1d-a9c9-4910-a0d6-86c7b9c42510",

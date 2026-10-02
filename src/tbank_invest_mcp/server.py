@@ -505,6 +505,30 @@ async def _named(query: str, kind: str, class_code: str) -> list[dict]:
     return _exact(await _search(query, kind, tradable_only=False), query, class_code)
 
 
+async def _listed(ticker: str, class_code: str, kind: str) -> list[dict]:
+    """The instrument with this ticker on this board, as a list of one or none.
+
+    Asked for directly: the API finds a ticker with its class code exactly, where a search
+    for a ticker of one letter (T_TQBR is such a share) brings megabytes and, when the API
+    is busy, nothing at all. Both are upper case in the API; a ticker that is not (the
+    future SiZ6) is tried as given first. The search remains as the last resort.
+    """
+    wanted = _enum(kind, "INSTRUMENT_TYPE_", INSTRUMENT_KINDS) if kind else ""
+    for spelling in dict.fromkeys((ticker, ticker.upper())):
+        try:
+            data = await _call("InstrumentsService", "GetInstrumentBy", {
+                "idType": "INSTRUMENT_ID_TYPE_TICKER", "id": spelling, "classCode": class_code.upper(),
+            })
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 404:
+                raise
+            continue
+        instrument = data.get("instrument")
+        if instrument and instrument.get("uid"):
+            return [instrument] if not wanted or instrument.get("instrumentKind") == wanted else []
+    return await _named(ticker, kind, class_code)
+
+
 def _listing(listings: list[dict], any_listing: bool) -> list[dict]:
     """The listing to use out of the listings of one paper; all of them if nothing decides.
 
@@ -543,14 +567,9 @@ async def _find_exact(identifier: str, kind: str = "", any_listing: bool = False
     if time.monotonic() - _missed.get(key, float("-inf")) < MISS_TTL_SECONDS:
         return None
 
-    attempts = [(identifier, "")]
-    if "_" in identifier:  # after the plain reading: tickers such as CNYRUB_TOM have one too
-        attempts.append(tuple(identifier.rsplit("_", 1)))
-    hits: list[dict] = []
-    for query, class_code in attempts:
-        hits = await _named(query, kind, class_code)
-        if hits:
-            break
+    hits = await _named(identifier, kind, "")
+    if not hits and "_" in identifier:  # after the plain reading: CNYRUB_TOM is a ticker
+        hits = await _listed(*identifier.rsplit("_", 1), kind)
 
     hits = [i for i in hits if _is_live(i)] or hits
     papers: dict[str, list[dict]] = {}
@@ -1349,7 +1368,13 @@ async def get_stock_snapshot(ticker: str, candle_days: int = 5, class_code: str 
     if candle_days < 1:
         raise ValueError(f"candle_days must be at least 1, got {candle_days}")
 
-    hits = await _search(ticker, "share", tradable_only=False)
+    # Among tradable shares first: for a ticker of one letter the list of everything it is
+    # a part of is megabytes. The full list is asked for when nothing tradable carries the
+    # ticker — it may be a share not tradable through the API — or matches the name.
+    hits = await _search(ticker, "share", tradable_only=True)
+    is_name = not ticker.isascii() or " " in ticker.strip()
+    if not _exact(hits, ticker.strip(), class_code) and not (is_name and hits):
+        hits = await _search(ticker, "share", tradable_only=False)
     rivals = _exact([i for i in hits if i.get("apiTradeAvailableFlag")], ticker.strip(), class_code)
     if len({i.get("isin") for i in rivals}) > 1:
         names = ", ".join(f"{i.get('ticker')} on {i.get('classCode')} ({i.get('name')})" for i in rivals[:8])
