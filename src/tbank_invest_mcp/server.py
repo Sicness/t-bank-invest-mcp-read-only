@@ -733,6 +733,20 @@ _OPERATION_REPEATS = ("instrumentKind", "assetUid", "brokerAccountId", "cursor")
 OPERATIONS_CAP = 1000
 
 
+def _one_per_id(operations: list[dict]) -> list[dict]:
+    """Trimmed operations with those sharing an id merged into one.
+
+    The API now and then sends an operation twice — seen on a sale executed in part, its
+    remainder canceled: the same id, state and payment in both, the commission in one copy
+    and the yield in the other. Passed on as they are, the payment counts twice.
+    """
+    merged: dict[str, dict] = {}
+    for n, operation in enumerate(operations):
+        key = operation.get("id") or f"\0{n}"  # no id: nothing to merge it with
+        merged[key] = {**merged.get(key, {}), **operation}
+    return list(merged.values())
+
+
 @read_only_tool
 async def get_operations(
     account_id: AccountId,
@@ -755,20 +769,22 @@ async def get_operations(
     their difference. A bond repayment has no quantity. Prices and quantities are as they
     were at the time: unlike candles, they are not adjusted for later splits.
 
-    Note: this method has no paging. A month of an active account is about 60 operations
-    and 26,000 characters, two months no longer fit into a client's limit — keep the range
-    to a month, or use get_operations_by_cursor. The API returns no more than 1000
+    Note: this method has no paging. An operation is about 450 characters, so about 100
+    of them fit into a client's limit, and a month of an active account can be twice that —
+    keep the range to a week or two, or use get_operations_by_cursor, which pages. The API
+    returns no more than 1000
     operations, the latest ones; when that happens the result starts with a "note" saying
     so, and the earlier operations are not in it.
 
     Args:
         account_id: Account ID
-        from_date: Start date (YYYY-MM-DD), default: 30 days ago
+        from_date: Start date (YYYY-MM-DD), default: 14 days ago — about as much as a
+            client's limit takes for an active account
         to_date: End date (YYYY-MM-DD, inclusive), default: now
         state: Filter by state: EXECUTED, CANCELED, PROGRESS (empty = all)
         figi: Filter by instrument — FIGI, ticker, ISIN or UID (empty = all instruments)
     """
-    body: dict[str, Any] = {"accountId": account_id, **_period(from_date, to_date, back=30)}
+    body: dict[str, Any] = {"accountId": account_id, **_period(from_date, to_date, back=14)}
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     if figi:
@@ -785,7 +801,9 @@ async def get_operations(
             f"latest ones. Operations before {earliest} are missing from this result. Use "
             "get_operations_by_cursor, or ask for a shorter range."
         ), **data}
-    return _fmt(data, "operations", drop=_OPERATION_REPEATS)
+    data = _trimmed(data, "operations", drop=_OPERATION_REPEATS)
+    data["operations"] = _one_per_id(data.get("operations", []))
+    return _fmt(data)
 
 
 @read_only_tool
@@ -819,7 +837,8 @@ async def get_operations_by_cursor(
     quantityRest what was not — an order can be executed in part. A bond repayment has no
     quantity. Prices and quantities are as they were at the time: unlike candles, they are
     not adjusted for later splits. positionUid is the key of a position: one paper can come
-    under several figi and instrumentUid.
+    under several figi and instrumentUid. The API can send an operation twice under one
+    id; within a page the two are merged, across pages add up by unique id.
 
     Common operation types: BUY, SELL, DIVIDEND, COUPON, TAX, BOND_TAX, INPUT, OUTPUT,
     BROKER_FEE, BOND_REPAYMENT_FULL, BOND_REPAYMENT; DIV_EXT is a dividend paid out to a
@@ -857,7 +876,9 @@ async def get_operations_by_cursor(
     if state:
         body["state"] = _enum(state, "OPERATION_STATE_", OPERATION_STATES)
     data = await _call("OperationsService", "GetOperationsByCursor", body)
-    return _fmt(data, "items", drop=_OPERATION_REPEATS)
+    data = _trimmed(data, "items", drop=_OPERATION_REPEATS)
+    data["items"] = _one_per_id(data.get("items", []))
+    return _fmt(data)
 
 
 # ── Instruments ──────────────────────────────────────────────────────────────

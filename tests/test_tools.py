@@ -194,6 +194,15 @@ class TestGetOperations:
         assert "from" in body
         assert "to" in body
 
+    async def test_default_range_is_two_weeks(self):
+        # A month of an active account is 60 to 260 operations; about a hundred fit a client.
+        mock = make_call_mock()
+        with patch.object(srv, "_call", mock):
+            await srv.get_operations("acc1")
+        _, _, body = mock.call_args[0]
+        span = srv._parse_date(body["to"]) - srv._parse_date(body["from"])
+        assert span.days == 14
+
     async def test_state_prefix(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
@@ -2203,6 +2212,25 @@ class TestSilentlyWrongAnswers:
             result = json.loads(await srv.get_last_prices("NOPE123,NOPE456"))
         assert calls_to(mock, "GetLastPrices") == []
         assert [r["requested"] for r in result["lastPrices"]] == ["NOPE123", "NOPE456"]
+
+    async def test_an_operation_the_api_sends_twice_comes_once(self):
+        # Real case: a sale executed in part, its remainder canceled, arrives as two items
+        # with one id — the commission in one, the yield in the other, the payment in both.
+        common = {"id": "1", "type": "OPERATION_TYPE_SELL", "state": "OPERATION_STATE_EXECUTED",
+                  "payment": money(26000), "quantity": "200", "quantityDone": "26", "quantityRest": "174"}
+        first = {**common, "yield": money(150), "commission": money(0), "childOperations": [], "cursor": "c-1"}
+        second = {**common, "yield": money(0), "commission": money(-13), "cancelDateTime": "2025-09-19T15:00:00Z",
+                  "childOperations": [{"instrumentUid": "i-1", "payment": money(-13)}], "cursor": "c-2"}
+        other = {"id": "2", "type": "OPERATION_TYPE_COUPON", "payment": money(50)}
+        with patch.object(srv, "_call", make_call_mock({"items": [first, second, other]})):
+            items = json.loads(await srv.get_operations_by_cursor("acc1"))["items"]
+        assert [i["id"] for i in items] == ["1", "2"]
+        assert sum(i["payment"] for i in items) == 26050
+        assert items[0]["yield"] == 150 and items[0]["commission"] == -13
+        assert items[0]["cancelDateTime"] and items[0]["childOperations"]
+        with patch.object(srv, "_call", make_call_mock({"operations": [first, second, other]})):
+            operations = json.loads(await srv.get_operations("acc1"))["operations"]
+        assert [o["id"] for o in operations] == ["1", "2"]
 
     @pytest.mark.parametrize("call", [
         lambda: srv.list_currencies("FOO"),
