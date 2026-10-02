@@ -1132,28 +1132,28 @@ class TestGetLastPrices:
     async def test_single_id(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_last_prices("figi1")
+            await srv.get_last_prices("BBG004730N88")
         _, _, body = mock.call_args[0]
-        assert body["instrumentId"] == ["figi1"]
+        assert body["instrumentId"] == ["BBG004730N88"]
 
     async def test_multiple_ids(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_last_prices("figi1,figi2,figi3")
+            await srv.get_last_prices("BBG004730N88,BBG0047315Y7,BBG004731032")
         _, _, body = mock.call_args[0]
-        assert body["instrumentId"] == ["figi1", "figi2", "figi3"]
+        assert body["instrumentId"] == ["BBG004730N88", "BBG0047315Y7", "BBG004731032"]
 
     async def test_strips_spaces(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_last_prices("figi1, figi2")
+            await srv.get_last_prices("BBG004730N88, BBG0047315Y7")
         _, _, body = mock.call_args[0]
-        assert body["instrumentId"] == ["figi1", "figi2"]
+        assert body["instrumentId"] == ["BBG004730N88", "BBG0047315Y7"]
 
     async def test_service_method(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_last_prices("figi1")
+            await srv.get_last_prices("BBG004730N88")
         service, method, _ = mock.call_args[0]
         assert service == "MarketDataService"
         assert method == "GetLastPrices"
@@ -1193,24 +1193,24 @@ class TestGetClosePrices:
     async def test_single_id(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_close_prices("figi1")
+            await srv.get_close_prices("BBG004730N88")
         _, _, body = mock.call_args[0]
-        assert body["instruments"] == [{"instrumentId": "figi1"}]
+        assert body["instruments"] == [{"instrumentId": "BBG004730N88"}]
 
     async def test_multiple_ids(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_close_prices("figi1,figi2")
+            await srv.get_close_prices("BBG004730N88,BBG0047315Y7")
         _, _, body = mock.call_args[0]
         assert body["instruments"] == [
-            {"instrumentId": "figi1"},
-            {"instrumentId": "figi2"},
+            {"instrumentId": "BBG004730N88"},
+            {"instrumentId": "BBG0047315Y7"},
         ]
 
     async def test_service_method(self):
         mock = make_call_mock()
         with patch.object(srv, "_call", mock):
-            await srv.get_close_prices("figi1")
+            await srv.get_close_prices("BBG004730N88")
         service, method, _ = mock.call_args[0]
         assert service == "MarketDataService"
         assert method == "GetClosePrices"
@@ -1403,10 +1403,10 @@ class TestReturnFormatting:
         assert "\\u" not in result
 
     async def test_amounts_are_plain_numbers_in_every_tool(self):
-        mock = make_call_mock({"lastPrices": [{"figi": "F", "price": {"units": "274", "nano": 270000000}}]})
-        with patch.object(srv, "_call", mock):
-            result = json.loads(await srv.get_last_prices("e6123145-9665-43e0-8413-cd61b8aa9b13"))
-        assert result == {"lastPrices": [{"figi": "F", "price": 274.27}]}
+        record = {"figi": "F", "instrumentUid": SBER["uid"], "price": {"units": "274", "nano": 270000000}}
+        with patch.object(srv, "_call", make_call_mock({"lastPrices": [record]})):
+            result = json.loads(await srv.get_last_prices(SBER["uid"]))
+        assert result == {"lastPrices": [{"figi": "F", "instrumentUid": SBER["uid"], "price": 274.27}]}
 
 
 # ── Instrument identifiers ────────────────────────────────────────────────────
@@ -1522,7 +1522,7 @@ class TestInstrumentResolution:
         assert peak <= srv.LOOKUP_BATCH
         assert len({b["query"] for b in calls_to(mock, "FindInstrument")}) == 30
         assert len(calls_to(mock, "FindInstrument")) == 60  # short names: tradable, then all, once each
-        assert len(call_body(mock, "GetLastPrices")["instrumentId"]) == 60
+        assert calls_to(mock, "GetLastPrices") == []  # none was found, so there is nothing to ask about
 
     async def test_only_exact_matches_count(self):
         # "SBER" also finds SBERP and every Sber bond; a name is not an identifier.
@@ -1660,7 +1660,8 @@ class TestInstrumentResolution:
         with patch.object(srv, "_call", mock):
             await srv.get_last_prices(f"SBER, {SBERP['uid']},SBERP")
             await srv.get_close_prices("SBER,SBERP")
-        assert call_body(mock, "GetLastPrices") == {"instrumentId": [SBER["uid"], SBERP["uid"], SBERP["uid"]]}
+        # each instrument once, however many times and ways it was named
+        assert call_body(mock, "GetLastPrices") == {"instrumentId": [SBER["uid"], SBERP["uid"]]}
         assert call_body(mock, "GetClosePrices") == {
             "instruments": [{"instrumentId": SBER["uid"]}, {"instrumentId": SBERP["uid"]}],
         }
@@ -2138,19 +2139,70 @@ class TestSilentlyWrongAnswers:
                 await tool(empty)
         mock.assert_not_called()
 
-    async def test_unknown_identifier_in_a_price_list_is_named(self):
-        # The API answers it with a record whose every field is empty, in its place in the list.
-        stub = {"figi": "", "ticker": "", "classCode": "", "instrumentUid": "", "lastPriceType": "LAST_PRICE_UNSPECIFIED"}
-        price = {"figi": "BBG004730N88", "ticker": "SBER", "instrumentUid": SBER["uid"], "price": quotation(274)}
-        mock = route(FindInstrument=search_results(SBER), GetLastPrices={"lastPrices": [price, stub]},
-                     GetClosePrices={"closePrices": [{"figi": "", "instrumentUid": ""}, price]})
+    @staticmethod
+    def _prices_api(*known):
+        """GetLastPrices / GetClosePrices the way the API answers a list, as measured live:
+        an instrument named twice comes once, every identifier it does not know is folded
+        into one record with all fields empty, and an unknown UID is echoed with nothing else."""
+        by_id = {i["uid"]: i for i in known} | {i["figi"]: i for i in known}
+
+        def records(ids):
+            out, seen, folded = [], set(), False
+            for i in ids:
+                if i in by_id:
+                    if by_id[i]["uid"] not in seen:
+                        seen.add(by_id[i]["uid"])
+                        out.append({"figi": by_id[i]["figi"], "ticker": by_id[i]["ticker"],
+                                    "instrumentUid": by_id[i]["uid"], "price": quotation(274)})
+                elif srv._is_uid(i):
+                    out.append({"figi": "", "ticker": "", "instrumentUid": i})
+                elif not folded:
+                    folded = True
+                    out.append({"figi": "", "ticker": "", "instrumentUid": ""})
+            return out
+
+        return route(
+            FindInstrument=lambda body: {"instruments": [i for i in known if i["ticker"] == body["query"]]},
+            GetLastPrices=lambda body: {"lastPrices": records(body["instrumentId"])},
+            GetClosePrices=lambda body: {"closePrices": records([i["instrumentId"] for i in body["instruments"]])},
+        )
+
+    UNKNOWN = "No instrument matches this identifier"
+    NO_SUCH_UID = "00000000-0000-0000-0000-000000000000"
+
+    @pytest.mark.parametrize("asked, expected", [
+        ("SBER,NOPE123,SBERP", ["SBER", "?NOPE123", "SBERP"]),
+        ("NOPE123", ["?NOPE123"]),
+        ("NOPE123,NOPE456", ["?NOPE123", "?NOPE456"]),
+        ("NOPE123,SBER,NOPE456", ["?NOPE123", "SBER", "?NOPE456"]),
+        ("NOPE123,NOPE123,SBER", ["?NOPE123", "?NOPE123", "SBER"]),
+        ("BBG000000000,SBER", ["?BBG000000000", "SBER"]),               # a FIGI nothing has
+        (f"{NO_SUCH_UID},SBER", [f"?{NO_SUCH_UID}", "SBER"]),             # the API echoes the UID back
+        ("SBER,BBG004730N88,sber", ["SBER", "SBER", "SBER"]),           # one paper named three ways
+        (SBER["uid"].upper(), ["SBER"]),
+    ])
+    async def test_a_price_list_has_one_record_per_requested_identifier(self, asked, expected):
+        for tool, key in ((srv.get_last_prices, "lastPrices"), (srv.get_close_prices, "closePrices")):
+            with patch.object(srv, "_call", self._prices_api(SBER, SBERP)):
+                result = json.loads(await tool(asked))[key]
+            assert [r.get("ticker") or "?" + r["requested"] for r in result] == expected
+            assert all(r.get("error", self.UNKNOWN) == self.UNKNOWN for r in result)
+            assert all(r["price"] == 274 for r in result if "ticker" in r)
+
+    async def test_a_uid_is_sent_in_lower_case(self):
+        # The API takes an upper-case UID for one it does not know.
+        mock = route()
         with patch.object(srv, "_call", mock):
-            last = json.loads(await srv.get_last_prices("SBER, NOPE123"))
-            close = json.loads(await srv.get_close_prices("NOPE123,SBER"))
-        assert last["lastPrices"][0]["price"] == 274
-        assert last["lastPrices"][1] == {"requested": "NOPE123", "error": "No instrument matches this identifier"}
-        assert close["closePrices"][0]["requested"] == "NOPE123"
-        assert close["closePrices"][1]["ticker"] == "SBER"
+            await srv.get_candles(SBER["uid"].upper())
+        assert call_body(mock, "GetCandles")["instrumentId"] == SBER["uid"]
+
+    async def test_nothing_is_asked_about_when_nothing_was_found(self):
+        # With no identifiers at all the API would send the whole market.
+        mock = self._prices_api(SBER)
+        with patch.object(srv, "_call", mock):
+            result = json.loads(await srv.get_last_prices("NOPE123,NOPE456"))
+        assert calls_to(mock, "GetLastPrices") == []
+        assert [r["requested"] for r in result["lastPrices"]] == ["NOPE123", "NOPE456"]
 
     @pytest.mark.parametrize("call", [
         lambda: srv.list_currencies("FOO"),

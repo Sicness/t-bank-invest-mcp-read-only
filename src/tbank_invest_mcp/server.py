@@ -582,9 +582,9 @@ async def _uid(
     a name, which is an error here. any_listing: see _find_exact.
     """
     identifier = identifier.strip()
-    if not identifier or _is_uid(identifier):
-        return identifier
-    if figi_ok and _FIGI_RE.fullmatch(identifier):
+    if _is_uid(identifier):
+        return identifier.lower()  # the API knows a UID in lower case only
+    if not identifier or (figi_ok and _FIGI_RE.fullmatch(identifier)):
         return identifier
     instrument = await _find_exact(identifier, kind, any_listing)
     if instrument:
@@ -1519,38 +1519,48 @@ async def get_candles(
     return _fmt(result)
 
 
-def _unknown_marked(prices: list[dict], given: list[str]) -> list[dict]:
-    """prices with the API's empty records replaced by the identifier that was not found.
+async def _prices(
+    given: list[str], method: str, key: str, body: Callable[[list[str]], dict]
+) -> dict:
+    """The answer of GetLastPrices or GetClosePrices, one record per requested identifier
+    and in the order of the request.
 
-    GetLastPrices and GetClosePrices answer in the order of the request, and for an
-    identifier they do not know send a record with every field empty.
+    The API's own list cannot be matched to the request: identifiers given twice come back
+    once, all the identifiers it does not know are folded into one record with every field
+    empty, and an unknown UID is echoed back with nothing else. So only what the lookup
+    here has found is sent, each record is found again by its UID or FIGI, and whatever is
+    left gets {requested, error} in its place.
     """
-    if len(prices) != len(given):
-        return prices
-    return [
-        price if price.get("instrumentUid") or price.get("figi")
-        else {"requested": identifier, "error": "No instrument matches this identifier"}
-        for price, identifier in zip(prices, given)
+    resolved = await _each(given, _uid)
+    # An identifier the lookup did not find stays as it was given: neither a UID nor a FIGI.
+    known = [r for r in dict.fromkeys(resolved) if _is_uid(r) or _FIGI_RE.fullmatch(r)]
+    data = await _call("MarketDataService", method, body(known)) if known else {}
+    found: dict[str, dict] = {}
+    for record in data.get(key, []):
+        if record.get("figi"):  # a UID or FIGI the API does not know has none
+            found[record.get("instrumentUid", "").lower()] = found[record["figi"]] = record
+    data[key] = [
+        found.get(r.lower() if _is_uid(r) else r)
+        or {"requested": identifier, "error": "No instrument matches this identifier"}
+        for identifier, r in zip(given, resolved)
     ]
+    return data
 
 
 @read_only_tool
 async def get_last_prices(instrument_ids: str) -> str:
     """Get last trade prices for one or more instruments.
 
-    The prices come in the order of the request, each with its ticker and classCode. An
-    identifier no instrument matches gives {"requested": ..., "error": ...} in its place.
+    One record per requested identifier, in the order of the request, each with its ticker
+    and classCode. An identifier no instrument matches gives {"requested": ..., "error":
+    ...} in its place.
     A bond's price is in percent of its nominal, not in money.
 
     Args:
         instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
     given = _given(instrument_ids, "instrument_ids")
-    ids = await _each(given, _uid)
-    data = await _call("MarketDataService", "GetLastPrices", {"instrumentId": ids})
-    if "lastPrices" in data:
-        data["lastPrices"] = _unknown_marked(data["lastPrices"], given)
-    return _fmt(data)
+    return _fmt(await _prices(given, "GetLastPrices", "lastPrices", lambda ids: {"instrumentId": ids}))
 
 
 @read_only_tool
@@ -1574,19 +1584,18 @@ async def get_order_book(instrument_id: str, depth: int = 20) -> str:
 async def get_close_prices(instrument_ids: str) -> str:
     """Get previous trading session close prices for instruments.
 
-    The prices come in the order of the request. An identifier no instrument matches gives
-    {"requested": ..., "error": ...} in its place. A bond's price is in percent of its
+    One record per requested identifier, in the order of the request. An identifier no
+    instrument matches gives {"requested": ..., "error": ...} in its place. A bond's price is in percent of its
     nominal, not in money.
 
     Args:
         instrument_ids: Comma-separated list of tickers, FIGIs, ISINs or UIDs
     """
     given = _given(instrument_ids, "instrument_ids")
-    instruments = [{"instrumentId": i} for i in await _each(given, _uid)]
-    data = await _call("MarketDataService", "GetClosePrices", {"instruments": instruments})
-    if "closePrices" in data:
-        data["closePrices"] = _unknown_marked(data["closePrices"], given)
-    return _fmt(data)
+    return _fmt(await _prices(
+        given, "GetClosePrices", "closePrices",
+        lambda ids: {"instruments": [{"instrumentId": i} for i in ids]},
+    ))
 
 
 @read_only_tool
