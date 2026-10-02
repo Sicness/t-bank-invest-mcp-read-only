@@ -1,6 +1,6 @@
 [project]
 name = "t-bank-invest-mcp-read-only"
-version = "1.0.0.dev3"
+version = "1.0.0.dev4"
 description = "MCP server for reading T-Bank (Tinkoff) investment portfolio data"
 readme = "README.md"
 requires-python = ">=3.11"
