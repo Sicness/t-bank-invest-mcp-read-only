@@ -13,6 +13,7 @@ from tbank_invest_mcp.server import (
     _get_token,
     _headers,
     _parse_date,
+    _period,
     _number,
     _to_quotation,
     _ts,
@@ -275,3 +276,26 @@ class TestTrimmed:
 
     def test_missing_list_is_fine(self):
         assert _trimmed({"a": 1}, "positions") == {"a": 1}
+
+
+class TestPeriod:
+    def test_defaults_are_counted_from_now(self):
+        period = _period("", "", back=14)
+        start, end = _parse_date(period["from"]), _parse_date(period["to"])
+        assert (end - start).days == 14
+        assert abs((datetime.now(timezone.utc) - end).total_seconds()) < 5
+
+    def test_an_end_in_the_past_given_alone_ends_a_range_of_the_same_length(self):
+        # Counted from today the range would start after it ends, and the API refuses it.
+        assert _period("", "2026-01-31", back=14) == {
+            "from": "2026-01-17T23:59:59Z", "to": "2026-01-31T23:59:59Z",
+        }
+
+    def test_an_end_in_the_future_leaves_the_start_at_today(self):
+        period = _period("", "2999-01-01", back=14)
+        assert (datetime.now(timezone.utc) - _parse_date(period["from"])).days == 14
+
+    def test_given_dates_are_taken_as_they_are(self):
+        assert _period("2026-01-01", "2026-01-31", back=14) == {
+            "from": "2026-01-01T00:00:00Z", "to": "2026-01-31T23:59:59Z",
+        }

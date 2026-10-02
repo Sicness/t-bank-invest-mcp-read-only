@@ -317,12 +317,14 @@ def _parse_date(
 
 def _period(from_date: str, to_date: str, *, back: int = 0, ahead: int = 0) -> dict[str, str]:
     """The "from" and "to" of a request: the dates given, or by default from `back` days ago
-    to `ahead` days from now. A to_date without a time includes that whole day."""
+    to `ahead` days from now. A to_date without a time includes that whole day.
+
+    A to_date in the past given alone ends a range of the same length: `back` days before
+    it, not before today — which would be a range that starts after it ends."""
     now = datetime.now(timezone.utc)
-    return {
-        "from": _ts(_parse_date(from_date, now - timedelta(days=back))),
-        "to": _ts(_parse_date(to_date, now + timedelta(days=ahead), end_of_day=True)),
-    }
+    start = _parse_date(from_date)
+    end = _parse_date(to_date, now + timedelta(days=ahead), end_of_day=True)
+    return {"from": _ts(start or min(now, end) - timedelta(days=back)), "to": _ts(end)}
 
 
 def _enum(value: str, prefix: str, allowed: tuple[str, ...] = ()) -> str:

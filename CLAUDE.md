@@ -42,7 +42,7 @@ Everything is in `src/tbank_invest_mcp/server.py`, top to bottom: constants → 
 | `_api_error(service, method, resp)` | the error line the model reads: HTTP status, method, the API's `message` and error code |
 | `_transport_error(service, method, exc, token)` | the same for failures with no HTTP status; httpx timeouts have an empty message, and the token is masked in whatever the error quotes |
 | `_ts(dt)` / `_parse_date(s, default, end_of_day=False)` | UTC datetime ↔ RFC 3339; accepts any ISO 8601 form, the ones the API sends included (fractions of a second, `Z`, an offset — converted to UTC); `end_of_day=True` turns a bare date into 23:59:59 of that day |
-| `_period(from_date, to_date, back=, ahead=)` | a request's `{"from", "to"}`: the dates given, or by default `back` days ago to `ahead` days from now, `to` through the end of its day |
+| `_period(from_date, to_date, back=, ahead=)` | a request's `{"from", "to"}`: the dates given, or by default `back` days ago to `ahead` days from now, `to` through the end of its day; a `to_date` in the past given alone ends a range of the same length |
 | `_enum(value, prefix, allowed=())` | full enum name from a value given with or without its prefix, in any case; with `allowed`, rejects an unknown value |
 | `_choices(*values)` | type for a string parameter whose JSON schema lists its values (`CandleInterval`, `InstrumentIdType`, …); the server validates nothing against the list, a client may |
 | `_plain(data)` | the response with every `{units, nano}` made a number and currencies folded into one `currency` field per object |
